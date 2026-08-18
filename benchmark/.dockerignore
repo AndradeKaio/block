@@ -1,0 +1,5 @@
+core/build/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+mining/progress.db
