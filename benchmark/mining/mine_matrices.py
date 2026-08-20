@@ -183,6 +183,19 @@ class StateDB:
             con.commit()
             con.close()
 
+    def lookup_id(self, name: str, grp: str):
+        """Return the cached SuiteSparse id for (name, grp) if this matrix
+        was already registered by a previous run, else None. Lets
+        --matrices-csv resolve ids it already knows about without an
+        ssgetpy.search() call for every row."""
+        with self._lock:
+            con = self._connect()
+            row = con.execute(
+                "SELECT id FROM matrices WHERE name=? AND grp=?", (name, grp)
+            ).fetchone()
+            con.close()
+        return row[0] if row else None
+
     def get_pending(self, include_done: bool = False):
         statuses = "('pending', 'failed', 'done')" if include_done else "('pending', 'failed')"
         with self._lock:
@@ -432,6 +445,15 @@ def parse_args():
     p.add_argument("--limit",     type=int, default=10,   help="Max matrices to process")
     p.add_argument("--matrix-ids",nargs="*", type=int, default=None, dest="matrix_ids",
                    help="Explicit SuiteSparse IDs (overrides search filters)")
+    p.add_argument("--matrices-csv", default=None, dest="matrices_csv", metavar="CSV",
+                   help="CSV with 'name' and 'group' columns -- mine exactly these "
+                        "matrices. SuiteSparse ids are resolved automatically (DB "
+                        "cache first, ssgetpy name search as fallback for anything "
+                        "not seen before) and written back into the CSV's 'id' "
+                        "column as a side effect, so re-running is DB-only after "
+                        "the first pass. Overrides --matrix-ids and search filters, "
+                        "same precedence --matrix-ids already has over search filters. "
+                        "Combine with --force to re-mine ones already done.")
     # Execution
     p.add_argument("--workers",   type=int, default=4,    help="Parallel worker threads")
     p.add_argument("--output-dir",
@@ -465,7 +487,54 @@ def main():
 
     # ── Resolve matrix list ───────────────────────────────────────────
     print("Querying SuiteSparse index ...")
-    if args.matrix_ids:
+    if args.matrices_csv:
+        import csv as _csv
+
+        with open(args.matrices_csv, newline="") as f:
+            reader = _csv.DictReader(f)
+            fieldnames = reader.fieldnames
+            if fieldnames is None or "name" not in fieldnames or "group" not in fieldnames:
+                sys.exit(
+                    f"{args.matrices_csv} needs 'name' and 'group' columns; "
+                    f"got: {fieldnames}"
+                )
+            csv_rows = list(reader)
+
+        # id resolution: check the local DB first (cheap, no network, and
+        # avoids ssgetpy's name= substring-match ambiguity for a matrix
+        # we've already resolved once), only falling back to a real
+        # ssgetpy.search(name=, group=) for rows the DB doesn't know yet.
+        matrices = []
+        csv_changed = False
+        for row in csv_rows:
+            name, group = row["name"], row["group"]
+            mid = db.lookup_id(name, group)
+            if mid is not None:
+                m = ssgetpy.search(matid=mid)[0]
+            else:
+                candidates = ssgetpy.search(name=name, group=group, limit=10)
+                exact = [c for c in candidates if c.name == name and c.group == group]
+                if len(exact) != 1:
+                    sys.exit(
+                        f"Could not resolve exactly one SuiteSparse match for "
+                        f"{group}/{name} ({len(exact)} exact matches out of "
+                        f"{len(candidates)} name-substring candidates) -- fix "
+                        f"the name/group in {args.matrices_csv}."
+                    )
+                m = exact[0]
+            matrices.append(m)
+            if row.get("id", "").strip() != str(m.id):
+                row["id"] = str(m.id)
+                csv_changed = True
+
+        if csv_changed:
+            out_fieldnames = ["id"] + [c for c in fieldnames if c != "id"]
+            with open(args.matrices_csv, "w", newline="") as f:
+                writer = _csv.DictWriter(f, fieldnames=out_fieldnames)
+                writer.writeheader()
+                writer.writerows(csv_rows)
+            print(f"Resolved ids -- wrote them back into {args.matrices_csv}")
+    elif args.matrix_ids:
         matrices = [ssgetpy.search(matid=mid)[0] for mid in args.matrix_ids]
     else:
         row_bounds = (args.min_rows, args.max_rows) if (args.min_rows or args.max_rows) else None

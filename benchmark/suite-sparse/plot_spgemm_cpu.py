@@ -6,7 +6,9 @@ X-axis : matrices ordered by NNZ (ascending)
 Y-axis : mean time per run (compute, total, or symbolic)
 Columns: one scatter point per contender per matrix
 
-By default shows total_ms (amortised symbolic + compute).
+By default shows total_ms (symbolic + compute, symbolic measured fresh on
+every run -- see benchmark_spgemm_cpu.py's docstring -- not a one-time cost
+divided by N; this is a real cold-call cost, averaged across runs).
 Use --compute-only to show the pure numeric phase only.
 
 Usage:
@@ -88,7 +90,7 @@ def parse_args():
         action="store_true",
         default=False,
         dest="compute_only",
-        help="Plot compute time only (excludes amortised symbolic)",
+        help="Plot compute time only (excludes symbolic)",
     )
     p.add_argument(
         "--show",
@@ -293,10 +295,10 @@ def main():
         time_label = "compute time"
     elif args.total_time:
         time_col = "total_ms"
-        time_label = "total time (amortised symbolic + compute)"
+        time_label = "total time (symbolic + compute, symbolic redone every run)"
     else:
         time_col = "total_ms"
-        time_label = "total time (amortised symbolic + compute)"
+        time_label = "total time (symbolic + compute, symbolic redone every run)"
 
     stats = build_stats(df, time_col)
 

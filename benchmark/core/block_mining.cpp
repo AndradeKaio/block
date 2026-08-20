@@ -55,6 +55,41 @@ struct CSRMiner {
         return count;
     }
 
+    // Returns true if row `row`'s column range [c0, c1) contains at least one
+    // DEAD nnz -- a real matrix entry already claimed by an earlier block.
+    // query_row/query_col above only COUNT alive entries for the fill ratio;
+    // they don't stop a block from growing into a strip that also contains
+    // dead ones. Growing there anyway would make this block's rectangle
+    // geometrically cover a cell another block already owns -- and
+    // mine_matrix.cpp's value write-back re-scans the raw CSR by column
+    // range only (it doesn't check `alive`), so that cell's real value
+    // would get written into BOTH blocks' storage, corrupting anything that
+    // sums block contributions (both the reconstructed matrix and the
+    // actual SpMM/SpGEMM compute kernels, which accumulate per block).
+    // Must be checked and used to hard-block growth, not just discounted
+    // from the fill numerator like alive-only counting does.
+    bool has_dead_in_row(int row, int c0, int c1) const {
+        const int* beg = col_idx + row_ptr[row];
+        const int* end = col_idx + row_ptr[row + 1];
+        const int* lo  = std::lower_bound(beg, end, c0);
+        const int* hi  = std::lower_bound(lo,  end, c1);
+        for (const int* p = lo; p < hi; ++p)
+            if (!alive[p - col_idx])
+                return true;
+        return false;
+    }
+
+    bool has_dead_in_col(int col, int r0, int r1) const {
+        for (int r = r0; r < r1; ++r) {
+            const int* beg = col_idx + row_ptr[r];
+            const int* end = col_idx + row_ptr[r + 1];
+            const int* p   = std::lower_bound(beg, end, col);
+            if (p < end && *p == col && !alive[p - col_idx])
+                return true;
+        }
+        return false;
+    }
+
     // Mark all alive NNZs inside the rectangle [r, r+h) x [c, c+w) as dead.
     void delete_block(int r, int c, int h, int w) {
         for (int row = r; row < r + h; ++row) {
@@ -78,7 +113,7 @@ static Block expand_block_retry(int seed_r, int seed_c,
     for (;;) {
         bool grew = false;
 
-        if (c + w < csr.N) {
+        if (c + w < csr.N && !csr.has_dead_in_col(c + w, r, r + h)) {
             int fill          = csr.query_col(c + w, r, r + h);
             long long new_imp = imp + (h - fill);
             float new_area    = float(h) * float(w + 1);
@@ -90,7 +125,7 @@ static Block expand_block_retry(int seed_r, int seed_c,
             }
         }
 
-        if (r + h < csr.M) {
+        if (r + h < csr.M && !csr.has_dead_in_row(r + h, c, c + w)) {
             int fill          = csr.query_row(r + h, c, c + w);
             long long new_imp = imp + (w - fill);
             float new_area    = float(h + 1) * float(w);
@@ -128,6 +163,8 @@ static Block expand_block_perm_disable(int seed_r, int seed_c,
             int nw = w + 1;
             if (float(std::max(h, nw)) / float(std::min(h, nw)) > p.Thslim && nw > h) {
                 expand_right = false;
+            } else if (csr.has_dead_in_col(c + w, r, r + h)) {
+                expand_right = false;
             } else {
                 int fill = csr.query_col(c + w, r, r + h);
                 if (float(fill) < float(h) * (1.0f - p.Twf)) {
@@ -148,6 +185,8 @@ static Block expand_block_perm_disable(int seed_r, int seed_c,
             if (r + h >= csr.M) {
                 expand_down = false;
             } else if (float(std::max(nh, w)) / float(std::min(nh, w)) > p.Thslim && nh > w) {
+                expand_down = false;
+            } else if (csr.has_dead_in_row(r + h, c, c + w)) {
                 expand_down = false;
             } else {
                 int fill = csr.query_row(r + h, c, c + w);

@@ -14,7 +14,11 @@
 
 namespace {
 
-using Scalar = float;
+// double, matching TACO's own bench_taco.c (Bv/Cv/A_t->vals are all
+// `double`) -- was float; switched so the two are comparable at a tight
+// tolerance instead of only "within float32 precision". See
+// gen_spgemm_kernels.py's docstring for the matching codegen change.
+using Scalar = double;
 using Clock = std::chrono::steady_clock;
 
 struct Args {
@@ -175,78 +179,90 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  auto plan = benchmark_core::cpu_plan_build(fused, A, B);
-
   std::printf("kernel: %s\n", args.specialized ? "specialized" : "generic");
 
-  std::vector<double> compute_ms_arr;
+  // Every timed run redoes the full symbolic pipeline (intersect -> merge ->
+  // fuse -> plan_build) from scratch instead of reusing the `fused`/`plan`
+  // computed above -- that first pass exists only for the early-exit check
+  // and the histogram print. A real caller who invokes SpGEMM once pays the
+  // full, un-amortised symbolic cost; reporting the mean of N independently
+  // measured symbolic passes (instead of one measurement divided by N)
+  // reflects that honestly.
+  std::vector<double> symbolic_ms_arr, compute_ms_arr;
+  symbolic_ms_arr.reserve(args.runs + 1);
   compute_ms_arr.reserve(args.runs + 1);
 
   for (int r = 0; r <= args.runs; ++r) {
+    auto ts0 = Clock::now();
+    auto found_r  = benchmark_core::find_intersecting_pairs(A.blocks, B.blocks);
+    auto groups_r = benchmark_core::merge_overlapping_output_blocks(found_r.output_blocks);
+    auto fused_r  = benchmark_core::block_fusion(found_r.output_blocks,
+                                                  found_r.contributions, groups_r);
+    auto plan     = benchmark_core::cpu_plan_build(fused_r, A, B);
+    symbolic_ms_arr.push_back(double(ms_since(ts0)));
+
     double ms = args.specialized
                     ? benchmark_core::cpu_compute<Scalar, true>(plan)
                     : benchmark_core::cpu_compute<Scalar, false>(plan);
     compute_ms_arr.push_back(ms);
-  }
 
-  const benchmark_core::Matrix<Scalar> &C = plan.C;
-
-  std::printf("runs=%d  last: compute=%.3fms\n", args.runs,
-              compute_ms_arr.back());
-
-  // Optional validation dump
-  if (!args.validate.empty()) {
-    std::vector<std::tuple<int, int, Scalar>> entries;
-    for (const auto &blk : C.blocks) {
-      for (int ri = 0; ri < blk.h; ++ri) {
-        for (int ci = 0; ci < blk.w; ++ci) {
-          Scalar v = C.values[blk.offset + (long long)ri * blk.w + ci];
-          if (v != Scalar(0))
-            entries.emplace_back(blk.r + ri, blk.c + ci, v);
+    // Optional validation dump — from the last run's output.
+    if (r == args.runs && !args.validate.empty()) {
+      std::vector<std::tuple<int, int, Scalar>> entries;
+      for (const auto &blk : plan.C.blocks) {
+        for (int ri = 0; ri < blk.h; ++ri) {
+          for (int ci = 0; ci < blk.w; ++ci) {
+            Scalar v = plan.C.values[blk.offset + (long long)ri * blk.w + ci];
+            if (v != Scalar(0))
+              entries.emplace_back(blk.r + ri, blk.c + ci, v);
+          }
         }
       }
-    }
-    std::sort(entries.begin(), entries.end());
-    FILE *vf = std::fopen(args.validate.c_str(), "w");
-    if (!vf) {
-      std::fprintf(stderr, "prisma_cpu_bench: cannot open validate file: %s\n",
-                   args.validate.c_str());
-    } else {
-      for (const auto &[r, c, v] : entries)
-        std::fprintf(vf, "%d %d %.8e\n", r, c, v);
-      std::fclose(vf);
-      std::printf("validate: wrote %zu non-zeros to %s\n", entries.size(),
-                  args.validate.c_str());
+      std::sort(entries.begin(), entries.end());
+      FILE *vf = std::fopen(args.validate.c_str(), "w");
+      if (!vf) {
+        std::fprintf(stderr, "prisma_cpu_bench: cannot open validate file: %s\n",
+                     args.validate.c_str());
+      } else {
+        for (const auto &[rr, cc, v] : entries)
+          std::fprintf(vf, "%d %d %.8e\n", rr, cc, v);
+        std::fclose(vf);
+        std::printf("validate: wrote %zu non-zeros to %s\n", entries.size(),
+                    args.validate.c_str());
+      }
     }
   }
 
-  // Timing breakdown
-  auto avg_timed = [&]() {
-    if (compute_ms_arr.size() <= 1)
-      return compute_ms_arr.empty() ? 0.0 : compute_ms_arr[0];
+  std::printf("runs=%d  last: symbolic=%.3fms compute=%.3fms\n", args.runs,
+              symbolic_ms_arr.back(), compute_ms_arr.back());
+
+  // Timing breakdown — mean of the N real timed-run measurements.
+  auto avg = [](const std::vector<double> &v) {
+    if (v.size() <= 1)
+      return v.empty() ? 0.0 : v[0];
     double s = 0.0;
-    for (int i = 1; i < (int)compute_ms_arr.size(); ++i)
-      s += compute_ms_arr[i];
-    return s / double(compute_ms_arr.size() - 1);
-  }();
+    for (int i = 1; i < (int)v.size(); ++i)
+      s += v[i];
+    return s / double(v.size() - 1);
+  };
+  double avg_sym  = avg(symbolic_ms_arr);
+  double avg_comp = avg(compute_ms_arr);
 
   std::printf("\n── symbolic breakdown ───────────────────────────────────\n");
-  std::printf("    intersect_pairs  : %8.3f ms\n", pipe_intersect_ms);
-  std::printf("    overlap+merge    : %8.3f ms\n", pipe_merge_ms);
-  std::printf("    block_fusion     : %8.3f ms\n", pipe_fuse_ms);
-  std::printf("    total            : %8.3f ms\n", pipe_total_ms);
+  std::printf("  symbolic per-run (avg of %d timed runs, redone cold every run)\n",
+              args.runs);
+  std::printf("    symbolic total   : %8.3f ms\n", avg_sym);
   std::printf("  compute per-run (avg of %d timed runs)\n", args.runs);
-  std::printf("    compute total    : %8.3f ms\n", avg_timed);
+  std::printf("    compute total    : %8.3f ms\n", avg_comp);
   std::printf("────────────────────────────────────────────────────────\n");
 
   std::printf("\nJSON_BEGIN\n{\n");
   std::printf("  \"kernel\": \"prisma_cpu\",\n");
   std::printf("  \"n_pairs\": %zu, \"n_groups\": %zu,\n",
               found.contributions.size(), fused.fused_blocks.size());
-  std::printf("  \"pipe_intersect_ms\": %.4f,\n", pipe_intersect_ms);
-  std::printf("  \"pipe_merge_ms\": %.4f,\n", pipe_merge_ms);
-  std::printf("  \"pipe_fuse_ms\": %.4f,\n", pipe_fuse_ms);
-  std::printf("  \"pipe_total_ms\": %.4f,\n", pipe_total_ms);
+  std::printf("  \"symbolic_ms\": ");
+  print_arr(symbolic_ms_arr);
+  std::printf(",\n");
   std::printf("  \"compute_ms\": ");
   print_arr(compute_ms_arr);
   std::printf("\n}\nJSON_END\n");

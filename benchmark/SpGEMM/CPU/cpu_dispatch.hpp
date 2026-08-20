@@ -55,58 +55,6 @@ inline void gemm_fixed(const T *__restrict__ A, int lda,
   }
 }
 
-#if defined(__AVX2__) && defined(__FMA__)
-
-template <>
-inline void gemm_fixed<5, 4, 4, float>(const float *__restrict__ A, int lda,
-                                       const float *__restrict__ B, int ldb,
-                                       float *__restrict__ C, int ldc) {
-  __m128 c0 = _mm_loadu_ps(C);
-  __m128 c1 = _mm_loadu_ps(C + ldc);
-  __m128 c2 = _mm_loadu_ps(C + 2 * ldc);
-  __m128 c3 = _mm_loadu_ps(C + 3 * ldc);
-  __m128 c4 = _mm_loadu_ps(C + 4 * ldc);
-  for (int k = 0; k < 4; k++) {
-    __m128 bk = _mm_loadu_ps(B + k * ldb);
-    c0 = _mm_fmadd_ps(_mm_set1_ps(A[k]), bk, c0);
-    c1 = _mm_fmadd_ps(_mm_set1_ps(A[lda + k]), bk, c1);
-    c2 = _mm_fmadd_ps(_mm_set1_ps(A[2 * lda + k]), bk, c2);
-    c3 = _mm_fmadd_ps(_mm_set1_ps(A[3 * lda + k]), bk, c3);
-    c4 = _mm_fmadd_ps(_mm_set1_ps(A[4 * lda + k]), bk, c4);
-  }
-  _mm_storeu_ps(C, c0);
-  _mm_storeu_ps(C + ldc, c1);
-  _mm_storeu_ps(C + 2 * ldc, c2);
-  _mm_storeu_ps(C + 3 * ldc, c3);
-  _mm_storeu_ps(C + 4 * ldc, c4);
-}
-
-template <>
-inline void gemm_fixed<5, 4, 4, double>(const double *__restrict__ A, int lda,
-                                        const double *__restrict__ B, int ldb,
-                                        double *__restrict__ C, int ldc) {
-  __m256d c0 = _mm256_loadu_pd(C);
-  __m256d c1 = _mm256_loadu_pd(C + ldc);
-  __m256d c2 = _mm256_loadu_pd(C + 2 * ldc);
-  __m256d c3 = _mm256_loadu_pd(C + 3 * ldc);
-  __m256d c4 = _mm256_loadu_pd(C + 4 * ldc);
-  for (int k = 0; k < 4; k++) {
-    __m256d bk = _mm256_loadu_pd(B + k * ldb);
-    c0 = _mm256_fmadd_pd(_mm256_broadcast_sd(A + k), bk, c0);
-    c1 = _mm256_fmadd_pd(_mm256_broadcast_sd(A + lda + k), bk, c1);
-    c2 = _mm256_fmadd_pd(_mm256_broadcast_sd(A + 2 * lda + k), bk, c2);
-    c3 = _mm256_fmadd_pd(_mm256_broadcast_sd(A + 3 * lda + k), bk, c3);
-    c4 = _mm256_fmadd_pd(_mm256_broadcast_sd(A + 4 * lda + k), bk, c4);
-  }
-  _mm256_storeu_pd(C, c0);
-  _mm256_storeu_pd(C + ldc, c1);
-  _mm256_storeu_pd(C + 2 * ldc, c2);
-  _mm256_storeu_pd(C + 3 * ldc, c3);
-  _mm256_storeu_pd(C + 4 * ldc, c4);
-}
-
-#endif
-
 // Per-matrix named-register specializations of gemm_fixed<M,K,N,float>.
 // Must appear before gemm() so that specializations are visible at the point
 // where gemm() calls gemm_fixed<m,k,n>(...).

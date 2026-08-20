@@ -25,15 +25,29 @@ static std::vector<COO> read_mtx(const char* path, int& M, int& N) {
 
     char line[1024];
 
-    // Parse banner: %%MatrixMarket matrix coordinate <type> <symmetry>
-    bool is_symmetric = false;
-    bool is_pattern   = false;
+    // Parse banner: %%MatrixMarket matrix coordinate <type> <symmetry>.
+    // Only the FIRST line is the actual banner -- fixed by the MatrixMarket
+    // spec. Free-text %-comment lines that follow are documentation, not
+    // format, and must NOT be scanned for these keywords: real matrices
+    // routinely use words like "pattern"/"symmetric" in prose (e.g. "arises
+    // from a symmetric physical system") without being symmetric-format,
+    // which previously false-positived is_symmetric/is_pattern here and
+    // silently corrupted the mined .bsp for those matrices (extra mirrored
+    // entries, or every value replaced by 1.0) -- the exact same bug already
+    // found and fixed in SpMM/bench_taco_spmm.cpp's read_mtx; this mirrors
+    // that fix.
+    if (!fgets(line, sizeof(line), f))
+        throw std::runtime_error(std::string("empty file: ") + path);
+    char banner[1024];
+    std::strncpy(banner, line, sizeof(banner));
+    banner[sizeof(banner) - 1] = '\0';
+    for (char* p = banner; *p; ++p) *p = (char)tolower((unsigned char)*p);
+    bool is_pattern   = strstr(banner, "pattern") != nullptr;
+    bool is_symmetric = strstr(banner, "symmetric") || strstr(banner, "hermitian");
+
+    // Skip the remaining %-comment lines without inspecting their content.
     while (fgets(line, sizeof(line), f)) {
         if (line[0] != '%') break;
-        char* p = line;
-        while (*p) { *p = (char)tolower((unsigned char)*p); ++p; }
-        if (strstr(line, "pattern"))                              is_pattern   = true;
-        if (strstr(line, "symmetric") || strstr(line, "hermitian")) is_symmetric = true;
     }
 
     // `line` now holds the first non-comment line: M N NNZ
@@ -65,13 +79,30 @@ static void coo_to_csr(std::vector<COO>& coo, int M,
                         std::vector<int>& row_ptr,
                         std::vector<int>& col_idx,
                         std::vector<double>& val_csr) {
-    // Sort by (row, col) and deduplicate
+    // Sort by (row, col), then merge-SUM any duplicate (row, col) pairs --
+    // NOT arbitrarily keep-one-discard-the-rest. MatrixMarket's coordinate
+    // format convention (and what scipy.io.mmread + .tocsr() actually does)
+    // is that duplicate listed entries at the same position are summed --
+    // FEM assembly commonly writes per-element contributions to a shared
+    // DOF pair as separate lines rather than pre-summed. The previous
+    // std::unique-based dedup silently dropped every duplicate but the
+    // first, corrupting the value at that position -- found by comparing
+    // against scipy's reference (validate_bsp.py --deep) on real
+    // SuiteSparse matrices: pkustk01/07/08, thread, tsyl201, k3plates,
+    // msc10848, opt1, cegb3024, bundle1 all had a handful of positions
+    // silently wrong, every one a stiffness/FEM-assembled matrix.
     std::sort(coo.begin(), coo.end(), [](const COO& a, const COO& b) {
         return a.r != b.r ? a.r < b.r : a.c < b.c;
     });
-    coo.erase(std::unique(coo.begin(), coo.end(), [](const COO& a, const COO& b) {
-        return a.r == b.r && a.c == b.c;
-    }), coo.end());
+    std::vector<COO> merged;
+    merged.reserve(coo.size());
+    for (const auto& e : coo) {
+        if (!merged.empty() && merged.back().r == e.r && merged.back().c == e.c)
+            merged.back().v += e.v;
+        else
+            merged.push_back(e);
+    }
+    coo = std::move(merged);
 
     const int nnz = (int)coo.size();
     row_ptr.assign(M + 1, 0);

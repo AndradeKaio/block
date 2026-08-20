@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-suite-sparse/validate_spmm.py — Correctness validation for all SpMM contenders.
+suite-sparse/validate_spmm_cpu.py — Correctness validation for CPU SpMM
+contenders (TACO + Prisma CPU).
 
 For each matrix, every contender is run with --seed S and --dump-c to write its
 output C matrix.  prisma_cpu additionally dumps D via --dump-d.  The scipy
@@ -8,10 +9,15 @@ reference C_ref = S @ D is computed in Python and compared against each binary's
 output.  Since all contenders share the same seed and the same mt19937_64 RNG,
 they produce identical D, so all C outputs can also be cross-compared directly.
 
+GPU contenders (prisma_gpu_cuda_*, cusparse_*) are validated separately by
+validate_spmm_gpu.py — kept apart so this script only needs the CPU/TACO
+toolchain (g++), mirroring the benchmark_spmm_cpu.py / benchmark_spmm_gpu.py
+split.
+
 Usage:
-  python validate_spmm.py MATRICES.csv
-  python validate_spmm.py MATRICES.csv --bin-dir ../SpMM/ --no-compile
-  python validate_spmm.py MATRICES.csv --kernels prisma_tiled,prisma_static
+  python validate_spmm_cpu.py MATRICES.csv
+  python validate_spmm_cpu.py MATRICES.csv --bin-dir ../SpMM/ --no-compile
+  python validate_spmm_cpu.py MATRICES.csv --kernels prisma_tiled,prisma_static
 """
 
 import argparse
@@ -34,7 +40,7 @@ except ImportError:
     _HAVE_H5PY = False
 
 # ---------------------------------------------------------------------------
-# Paths (mirrors benchmark_spmm.py)
+# Paths (mirrors benchmark_spmm_cpu.py)
 # ---------------------------------------------------------------------------
 
 _SCRIPT_DIR = Path(__file__).parent
@@ -42,7 +48,7 @@ _SPMM_DIR   = _SCRIPT_DIR.parent / "SpMM"
 _DATA_ROOT  = Path("/home/kaio/datasets/suite-sparse")
 
 # ---------------------------------------------------------------------------
-# Contenders
+# Contenders — CPU only
 # ---------------------------------------------------------------------------
 
 # (label, binary_stem, input_ext, extra_flags)
@@ -55,61 +61,10 @@ CONTENDERS = [
     ("prisma_static",      "prisma_cpu_spmm_bench",     ".bsp", ["--specialized-kernels", "--static"]),
     ("prisma_tiled",       "prisma_cpu_spmm_bench",     ".bsp", ["--specialized-kernels", "--tile-n", "512"]),
     ("prisma_auto",        "prisma_cpu_spmm_bench",     ".bsp", ["--specialized-kernels", "--auto"]),
-    # These are now the BASE GPU lane (2026-08-15): prisma_gpu_spmm_bench's
-    # --specialized-kernels defaults to false (mirrors prisma_cpu_spmm_bench
-    # exactly -- see that binary's own --specialized-kernels flag), so the
-    # CUDA-fallback path always runs the generic kernel here, never the
-    # generated per-shape specialized dispatch -- that codegen path is
-    # newer/less exercised and was producing a base-vs-optimized comparison
-    # gap (no unoptimized GPU baseline existed) until this default flipped.
-    # TC (tensor-core) path is unaffected -- still active for TC-eligible
-    # blocks either way, see spmm_tc_tile_kernel.cuh.
-    ("prisma_gpu_cuda_fp64", "prisma_gpu_spmm_bench",   ".bsp", ["--precision", "fp64"]),
-    ("prisma_gpu_cuda_fp32", "prisma_gpu_spmm_bench",   ".bsp", ["--precision", "fp32"]),
-    # Debug/bisection row, NOT for normal use -- same binary as
-    # prisma_gpu_cuda_fp64 (label prefix "prisma_gpu" resolves to the same
-    # per-matrix binary in _prisma_binary_path regardless of suffix, so no
-    # recompile is needed), but forces every block through the CUDA-fallback
-    # path via prisma_gpu_spmm_bench.cu's --force-cuda-fallback flag. Added
-    # to definitively confirm/deny whether a correctness bug is confined to
-    # the TC (tensor-core) path: run with
-    #   --kernels prisma_cpu,prisma_gpu_cuda_fp64,prisma_gpu_cuda_fp64_nofallback
-    # If this row PASSes while prisma_gpu_cuda_fp64 FAILs on the same
-    # matrix, the bug is TC-specific.
-    ("prisma_gpu_cuda_fp64_nofallback", "prisma_gpu_spmm_bench", ".bsp",
-     ["--precision", "fp64", "--force-cuda-fallback"]),
-    # --row-group alternative CUDA-fallback dispatch (2026-08-15, brand new
-    # -- see spmm_gpu_plan.hpp's RowGroupTask/RowGroupItem and
-    # spmm_cuda_tile_kernel.cuh's spmm_row_group_kernel for the design).
-    # Same binary/precision domain as prisma_gpu_cuda_fp64 (full double,
-    # no tf32) -- expected to PASS at the caller's strict tolerance and
-    # agree with prisma_cpu/prisma_gpu_cuda_fp64 bit-for-bit modulo normal
-    # floating-point summation-order noise, since it computes the exact
-    # same sum, just grouped differently before each atomicAdd. This is
-    # the FIRST real-hardware test of this code path -- run it before
-    # trusting any --row-group timing number.
-    ("prisma_gpu_cuda_fp64_row_group", "prisma_gpu_spmm_bench", ".bsp",
-     ["--precision", "fp64", "--row-group"]),
-    # cuSPARSE vendor-library baseline (SpMM/GPU/cusparse_spmm_bench.cu) --
-    # a single POOLED binary (no per-matrix specialization, unlike Prisma),
-    # compiled by benchmark_spmm_gpu.py's compile_cusparse_bench into
-    # _GPU_BIN_DIR, same as prisma_gpu_* -- see _prisma_binary_path's
-    # "cusparse" branch. Reads S from .bsp (same truncated-then-upcast
-    # precision every other .bsp contender reads), so it's compared
-    # against C_ref_bsp like Prisma, not C_ref_mtx like TACO -- see the
-    # ext-based (not label-based) reference selection below.
-    # cusparse_fp64 is full native double, no tf32 shortcuts -- expected to
-    # PASS at the caller's strict tolerance, same as prisma_cpu.
-    # cusparse_fp32 is expected to fail its OWN strict individual check the
-    # same way prisma_gpu_cuda_fp32 already does (full float32 compute,
-    # not just S storage) -- only cross-checks between same-fp32-domain
-    # contenders get _F32_CROSS_RTOL/_F32_CROSS_ATOL relaxed treatment.
-    ("cusparse_fp64", "cusparse_spmm_bench", ".bsp", ["--precision", "fp64"]),
-    ("cusparse_fp32", "cusparse_spmm_bench", ".bsp", ["--precision", "fp32"]),
 ]
 
 # ---------------------------------------------------------------------------
-# Matrix location (same as benchmark_spmm.py)
+# Matrix location (same as benchmark_spmm_cpu.py)
 # ---------------------------------------------------------------------------
 
 
@@ -140,7 +95,7 @@ def load_matrix_list(csv_path: Path) -> list[dict]:
     return rows
 
 # ---------------------------------------------------------------------------
-# Compilation (delegates to benchmark_spmm.py helpers)
+# Compilation (delegates to benchmark_spmm_cpu.py helpers)
 # ---------------------------------------------------------------------------
 
 
@@ -186,7 +141,7 @@ def _load_bsp_as_csr(bsp: Path) -> scipy.sparse.csr_matrix | None:
 
 def compile_all(bin_dir: Path, matrices: list[dict]) -> None:
     sys.path.insert(0, str(_SCRIPT_DIR))
-    from benchmark_spmm import compile_binary, compile_prisma_per_matrix, _KERNELS
+    from benchmark_spmm_cpu import compile_binary, compile_prisma_per_matrix, _KERNELS
     print("Compiling TACO kernels:")
     for k, d in _KERNELS:
         compile_binary(bin_dir, k, d)
@@ -196,43 +151,20 @@ def compile_all(bin_dir: Path, matrices: list[dict]) -> None:
     print()
 
 
-_GPU_BIN_DIR = Path("/tmp/_prismac/")  # benchmark_spmm_gpu.py's own default
-# --work-dir (matches benchmark_spmm.py's own _TMP_DIR default for the same
-# reason -- keep compiled per-matrix binaries out of the source tree). Found
-# stale (still pointing at the old SpMM/GPU/ location) while actually
-# running benchmark_spmm_gpu.py's real compile path for the first time --
-# without this fix, validate_spmm.py would silently SKIP every GPU
-# contender ("binary not found") even right after a successful compile.
-
-
 def _prisma_binary_path(bin_dir: Path, name: str, label: str = "prisma_cpu",
                         stem: str = "") -> Path:
-    """Resolve a contender's binary path for one matrix. Three binary-layout
-    families exist:
-      1. Prisma CPU (label startswith "prisma", not "prisma_gpu") --
-         per-matrix specialized, under --bin-dir. See
-         compile_prisma_per_matrix in benchmark_spmm.py.
-      2. Prisma GPU (prisma_gpu_*) -- per-matrix specialized, always under
-         _GPU_BIN_DIR regardless of the caller's --bin-dir: compiled by a
-         completely separate script (benchmark_spmm_gpu.py, nvcc-only)
-         with its own directory convention, so following the CPU-oriented
-         --bin-dir here would silently look in the wrong place. See
-         compile_prisma_gpu_per_matrix in benchmark_spmm_gpu.py.
-      3. Pooled binaries (`stem` used as-is, no per-matrix compilation) --
-         TACO's pool lives under --bin-dir (CPU toolchain, see
-         benchmark_spmm.py's compile_binary); cuSPARSE's pool lives under
-         _GPU_BIN_DIR (compiled by benchmark_spmm_gpu.py's nvcc toolchain,
-         same reason prisma_gpu_* does -- see compile_cusparse_bench).
-         Distinguished by label prefix rather than input ext, since a
-         pooled *CPU* contender reading .bsp is conceivable in principle
-         even though none exists today.
+    """Resolve a contender's binary path for one matrix.
+
+    Two binary-layout families:
+      1. Prisma CPU (label startswith "prisma") -- per-matrix specialized,
+         under --bin-dir. See compile_prisma_per_matrix in
+         benchmark_spmm_cpu.py.
+      2. Pooled TACO binaries (`stem` used as-is, no per-matrix compilation)
+         -- live under --bin-dir (CPU toolchain, see benchmark_spmm_cpu.py's
+         compile_binary).
     """
-    if label.startswith("prisma_gpu"):
-        return _GPU_BIN_DIR / f"prisma_gpu_spmm_bench_{name}"
     if label.startswith("prisma"):
         return bin_dir / f"prisma_cpu_spmm_bench_{name}"
-    if label.startswith("cusparse"):
-        return _GPU_BIN_DIR / stem
     return bin_dir / stem
 
 # ---------------------------------------------------------------------------
@@ -260,26 +192,11 @@ def _compare(C: np.ndarray, C_ref: np.ndarray,
     )
 
 
-# prisma_gpu_cuda_fp64's TC (tensor-core) path computes tf32 for any
-# TC-eligible S-block (see spmm_tc_tile_kernel.cuh) -- ~10 mantissa bits,
-# not fp64's 52. On a well-conditioned matrix that's just a small uniform
-# relative error, but on the ill-conditioned matrices in this suite
-# (bcsstk27/bundle1/msc10848 -- stiffness/bundle-adjustment matrices with
-# per-row dynamic range up to 1e8+, verified directly against real .bsp
-# data during the 2026-08-14 investigation) individual C cells are often
-# near-zero results of catastrophic cancellation between much larger
-# terms. A PER-CELL relative tolerance is meaningless there: a
-# numerically unremarkable tf32-scale absolute error on a cancelled-to-
-# near-zero cell reads as a huge "relative" error despite nothing being
-# wrong. _compare_global_scale anchors the tolerance to the reference
-# matrix's own overall magnitude instead of each cell's own (possibly
-# ~0) value -- this still catches real corruption (the actual bug found
-# during that investigation put cells at ~1e34-1e38, dwarfing any
-# reasonable global-scale bound) while tolerating expected tf32 rounding
-# noise on cancellation-heavy cells. Not used for
-# prisma_gpu_cuda_fp64_nofallback, which computes fully in T (double) via
-# the CUDA-fallback path with no tf32 involved at all, so the standard
-# per-cell _compare is the correct, tighter check there.
+# Kept here (rather than dropped) because validate_spmm_gpu.py imports these
+# generic comparison helpers from this module -- prisma_gpu_cuda_fp64's tf32
+# tensor-core path needs a global-scale (not per-cell) tolerance; no CPU
+# contender needs it, but this stays the shared home for both validators'
+# comparison utilities.
 _TC_RTOL = 1e-2
 _TC_ATOL = 1e-6
 
@@ -312,6 +229,45 @@ def validate_matrix(row: dict, mtx: Path, bin_dir: Path,
     # an HDF5 float32→float64 upcast (no extra loss), so _load_bsp_as_csr matches.
     S_bsp = _load_bsp_as_csr(bsp) if bsp.exists() else None
 
+    all_pass = True
+
+    # --- S_bsp vs S_mtx: are they the SAME matrix? --------------------------
+    # This is checked directly, independent of D and of any compute kernel,
+    # because it has exactly one correct answer (mod. float32 storage
+    # truncation) — unlike the C-output cross-checks below, which legitimately
+    # need a looser tolerance since Prisma and TACO are handed different-
+    # precision S by design. Comparing S directly here, rather than only
+    # inferring it from downstream C differences, is what actually catches
+    # a corrupted .bsp (e.g. mine_matrix.cpp's is_symmetric/is_pattern
+    # false-positive from scanning free-text comment lines, not just the MTX
+    # banner) instead of that corruption hiding behind a "different domain,
+    # expect some gap" cross-check tolerance loose enough to swallow it too.
+    if S_bsp is not None:
+        # A numeric diff (not a structural/position-set comparison) is used
+        # deliberately: _load_bsp_as_csr drops stored zeros within a block
+        # via np.nonzero() (matching read_matrix_binsparse<double>'s own
+        # semantics -- a block CAN legitimately store an explicit zero at a
+        # real, non-implicit position), so S_bsp.nnz and S_mtx.nnz can differ
+        # even for a fully correct .bsp. Diffing values directly sidesteps
+        # that: a dropped explicit zero still comes out as 0 - 0 = 0 here,
+        # not a spurious mismatch.
+        S_diff = np.abs((S_bsp - S_mtx).toarray())
+        S_scale = 1e-6 + 1e-5 * np.abs(S_mtx.toarray())
+        S_mask = S_diff > S_scale
+        if S_mask.any():
+            n_bad = int(S_mask.sum())
+            print(f"  [S_bsp vs S_mtx       ] FAIL  {n_bad} entries differ beyond "
+                  f"float32-truncation tolerance -- .bsp does not represent the "
+                  f"same matrix as .mtx (max_diff={float(S_diff.max()):.3g}). "
+                  f"Every downstream Prisma check below is validating against "
+                  f"this same wrong S, so their PASS does not mean Prisma is "
+                  f"correct on the real matrix.")
+            all_pass = False
+        else:
+            print(f"  [S_bsp vs S_mtx       ] PASS  (nonzero-valued entries: "
+                  f"{S_bsp.nnz} vs {S_mtx.nnz} -- a difference here alone is not "
+                  f"a failure signal, see comment above)")
+
     # --- Get D from prisma_cpu (same RNG as all Prisma variants) -----------
     # TACO also uses mt19937_64 with the same seed after the .cpp rename.
     d_path  = tmp / f"{name}_D.bin"
@@ -333,27 +289,6 @@ def validate_matrix(row: dict, mtx: Path, bin_dir: Path,
     C_ref_bsp = (S_bsp @ D) if (D is not None and S_bsp is not None) else None
     C_ref_mtx = (S_mtx @ D) if D is not None else None
 
-    def _is_tc_lane(label: str) -> bool:
-        """True for any prisma_gpu_cuda_fp64* variant that still routes
-        TC-eligible blocks through the (unchanged) tf32 tensor-core path
-        -- i.e. every fp64 Prisma-GPU label EXCEPT _nofallback, which
-        explicitly disables TC via --force-cuda-fallback. --row-group and
-        --specialized-kernels (and any future *_<suffix> variant) only
-        change the CUDA-fallback dispatch strategy, never the TC path
-        itself, so they all still need the SAME relaxed tf32 tolerance
-        prisma_gpu_cuda_fp64 does -- see _compare_global_scale's
-        docstring. Originally an exact-string match
-        (label == "prisma_gpu_cuda_fp64"), which silently stopped
-        applying the relaxed check to prisma_gpu_cuda_fp64_row_group and
-        made a numerically-correct result (verified independently against
-        the base lane to ~1e-9, pure summation-order noise) look like a
-        FAIL under the strict tolerance -- found the hard way validating
-        --row-group's first real-hardware run (2026-08-15).
-        """
-        return (label.startswith("prisma_gpu_cuda_fp64")
-                and not label.endswith("_nofallback"))
-
-    all_pass = True
     results: dict[str, np.ndarray] = {}
     label_ext: dict[str, str] = {}  # for _domain()'s ext-based classification
 
@@ -402,19 +337,12 @@ def validate_matrix(row: dict, mtx: Path, bin_dir: Path,
         label_ext[label] = ext
 
         # Choose reference by which INPUT FORMAT the contender reads, not
-        # by label naming: .bsp readers (Prisma, cuSPARSE) get the
-        # truncated-precision-matching C_ref_bsp; .mtx readers (TACO) get
-        # the full-float64 C_ref_mtx.
+        # by label naming: .bsp readers (Prisma) get the truncated-
+        # precision-matching C_ref_bsp; .mtx readers (TACO) get the
+        # full-float64 C_ref_mtx.
         C_ref = C_ref_bsp if ext == ".bsp" else C_ref_mtx
         if C_ref is not None:
-            # Any TC lane (see _is_tc_lane) computes tf32 for TC-eligible
-            # blocks -- see _compare_global_scale's docstring for why a
-            # per-cell relative tolerance doesn't fit it.
-            if _is_tc_lane(label):
-                ok, max_err, max_rel, failures = _compare_global_scale(
-                    C, C_ref, _TC_RTOL, _TC_ATOL)
-            else:
-                ok, max_err, max_rel, failures = _compare(C, C_ref, rtol, atol)
+            ok, max_err, max_rel, failures = _compare(C, C_ref, rtol, atol)
             if ok:
                 print(f"  [{label:<22}] PASS")
             else:
@@ -426,49 +354,15 @@ def validate_matrix(row: dict, mtx: Path, bin_dir: Path,
             print(f"  [{label:<22}] (no reference — output captured)")
 
     # --- Cross-compare all captured outputs --------------------------------
-    # Three independent precision axes distinguish contenders, each its own
-    # real, expected gap rather than a compute bug:
-    #   (a) S storage precision — Prisma reads S from .bsp (float32-stored
-    #       values, upcast to double); TACO reads S from .mtx (native
-    #       float64). Verified: bsp values are bit-exact float32
-    #       truncations of the mtx values.
-    #   (b) C compute precision — prisma_gpu_cuda_fp32 computes the whole
-    #       GEMM (D generation downcast, every FMA, atomicAdd accumulation)
-    #       in float32; every other contender computes in float64. This is
-    #       a coarser, different-natured gap than (a) — not just S's
-    #       stored constants losing precision, but the accumulation itself.
-    #   (c) tf32 tensor-core acceleration — prisma_gpu_cuda_fp64 computes
-    #       TC-eligible S-blocks in tf32 (see _compare_global_scale's
-    #       docstring); prisma_gpu_cuda_fp64_nofallback does not (forces
-    #       every block through the CUDA-fallback path, fully double), so
-    #       despite the similar label it belongs in the full-precision
-    #       domain along with prisma_cpu, not this one.
-    # A pair differing on ANY axis needs a relaxed tolerance; only a pair
-    # matching on all three shares its reference's precision exactly and
-    # keeps the caller's strict tolerance, gating all_pass — a mismatch
-    # there would indicate a real kernel bug. The individual PASS checks
-    # above already validate each contender against the reference matching
-    # its own S precision, which is the real correctness gate; cross-domain
-    # mismatches here are reported for visibility only.
+    # S storage precision is the only real precision axis left once GPU
+    # contenders are out of scope: Prisma reads S from .bsp (float32-stored
+    # values, upcast to double); TACO reads S from .mtx (native float64).
+    # Verified: bsp values are bit-exact float32 truncations of the mtx
+    # values, so a pair differing on this axis needs a relaxed tolerance;
+    # only a same-ext pair shares its reference's precision exactly and
+    # keeps the caller's strict tolerance, gating all_pass.
     _F32_CROSS_RTOL = 1e-4
     _F32_CROSS_ATOL = 1e-6
-
-    def _domain(label: str, ext: str) -> tuple[str, bool, bool]:
-        """Classify a contender by precision domain for cross-check
-        tolerance selection. First component used to be
-        label.startswith("prisma") -- a naming-based proxy for "reads S
-        from .bsp (block-truncated storage precision) vs .mtx (full
-        float64)", which is what actually determines whether two
-        contenders' S data is close enough to expect strict agreement.
-        Using ext directly instead is backward-compatible (every
-        pre-cuSPARSE contender's ext and the old naming proxy always
-        coincided: .bsp <=> prisma-family, .mtx <=> TACO) and correctly
-        buckets a new non-"prisma"-named .bsp contender (cuSPARSE) into
-        the same strict-agreement domain as prisma_cpu/
-        prisma_gpu_cuda_fp64_nofallback instead of treating it as an
-        always-expected cross-domain mismatch against them.
-        """
-        return (ext, label.endswith("_fp32"), _is_tc_lane(label))
 
     labels = list(results.keys())
     if len(labels) > 1:
@@ -476,22 +370,15 @@ def validate_matrix(row: dict, mtx: Path, bin_dir: Path,
         for i in range(len(labels)):
             for j in range(i + 1, len(labels)):
                 la, lb = labels[i], labels[j]
-                same_domain = _domain(la, label_ext[la]) == _domain(lb, label_ext[lb])
-                if _is_tc_lane(la) or _is_tc_lane(lb):
-                    cmp_fn = _compare_global_scale
-                    cmp_rtol, cmp_atol = _TC_RTOL, _TC_ATOL
-                    gap_desc = "tf32 tensor-core precision gap"
-                else:
-                    cmp_fn = _compare
-                    cmp_rtol, cmp_atol = (rtol, atol) if same_domain else \
-                        (max(rtol, _F32_CROSS_RTOL), max(atol, _F32_CROSS_ATOL))
-                    gap_desc = "float32-vs-float64 precision gap"
-                ok, max_err, max_rel, failures = cmp_fn(
+                same_domain = label_ext[la] == label_ext[lb]
+                cmp_rtol, cmp_atol = (rtol, atol) if same_domain else \
+                    (max(rtol, _F32_CROSS_RTOL), max(atol, _F32_CROSS_ATOL))
+                ok, max_err, max_rel, failures = _compare(
                     results[la], results[lb], cmp_rtol, cmp_atol
                 )
                 if not ok:
                     tag = "CROSS-MISMATCH" if same_domain else \
-                        f"CROSS-DIFF (expected {gap_desc})"
+                        "CROSS-DIFF (expected .bsp-vs-.mtx storage precision gap)"
                     print(f"  {tag}: {la} vs {lb}  "
                           f"max_diff={max_err:.3g}  max_rel={max_rel:.3g}  "
                           f"failures={failures}/{results[la].size}")
@@ -510,7 +397,7 @@ def validate_matrix(row: dict, mtx: Path, bin_dir: Path,
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="SpMM correctness validation (all contenders vs scipy reference)",
+        description="SpMM CPU correctness validation (TACO + Prisma CPU vs scipy reference)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -594,7 +481,7 @@ def main() -> None:
 
     n_pass = n_fail = n_skip = 0
 
-    with tempfile.TemporaryDirectory(prefix="validate_spmm_") as tmp_str:
+    with tempfile.TemporaryDirectory(prefix="validate_spmm_cpu_") as tmp_str:
         tmp = Path(tmp_str)
         for i, row in enumerate(matrices, 1):
             name  = row["name"]

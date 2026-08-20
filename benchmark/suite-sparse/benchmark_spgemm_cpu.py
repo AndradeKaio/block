@@ -8,9 +8,14 @@ Computes C = A × A (square self-product) and compares:
   prisma_generic — Prisma, gemm_fallback (#pragma omp simd, auto-vectorised)
   prisma_top10   — Prisma, per-matrix compiled with top-N (M,K,N) dispatch table
 
-The Prisma symbolic pipeline (intersect pairs → merge groups → block fusion) runs
-once per matrix; its cost is amortized over the timed compute runs.
-For prisma_top10, the top-shapes analysis time is also included in the symbolic cost.
+The symbolic pipeline (TACO's assemble(); Prisma's intersect pairs → merge groups
+→ block fusion → plan build) is redone from scratch on every timed run, not run
+once and amortized -- a cold, one-off caller pays the full symbolic cost each
+call, so the reported symbolic_ms is a mean of N real measurements. The one
+exception is prisma_top10's one-time top-shapes analysis (needed before it can
+even compile its specialized kernel): that setup cost genuinely happens once
+regardless of how many runs follow, so it alone is amortized (divided by the
+number of timed runs) on top of each run's own real symbolic measurement.
 
 Usage:
   python benchmark_spgemm_cpu.py matrices.csv
@@ -148,7 +153,7 @@ def _parse_json_block(stdout: str) -> dict:
         return {}
 
 
-_TACO_ASM_RE  = re.compile(r"^assemble_ns=(\d+)")
+_TACO_ASM_RE  = re.compile(r"run_(\d+)_assemble_ns=(\d+)")
 _TACO_COMP_RE = re.compile(r"run_(\d+)_compute_ns=(\d+)")
 
 
@@ -263,34 +268,37 @@ def run_taco_cpu(
     runs: int,
     timeout: int,
 ) -> list[tuple[float, float, float]]:
-    """Run bench_taco (A×A) and return [(symbolic_ms, compute_ms, total_ms)]."""
+    """Run bench_taco (A×A) and return [(symbolic_ms, compute_ms, total_ms)].
+
+    Every run redoes TACO's assemble() from scratch (see bench_taco.c) instead
+    of assembling once and reusing the pattern, so symbolic_ms below is a real
+    per-run measurement -- a cold, one-off caller pays the full assemble()
+    cost, not a single measurement divided by n_timed. Averaging N real
+    measurements (which plot_spgemm_cpu.py's groupby(...).mean() already does)
+    reflects that honestly.
+    """
     cmd = [str(binary), str(mtx), str(mtx), str(runs + 1)]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
         raise RuntimeError(f"{binary.name} exited {r.returncode}:\n{r.stderr[-800:]}")
 
-    assemble_ns: int = 0
+    asm_ns: dict[int, int] = {}
     comp_ns: dict[int, int] = {}
     for line in r.stdout.splitlines():
         m = _TACO_ASM_RE.match(line)
         if m:
-            assemble_ns = int(m.group(1))
+            asm_ns[int(m.group(1))] = int(m.group(2))
         m = _TACO_COMP_RE.match(line)
         if m:
             comp_ns[int(m.group(1))] = int(m.group(2))
 
-    if not comp_ns:
+    if not comp_ns or not asm_ns:
         raise RuntimeError(f"{binary.name}: could not parse timing from stdout")
-
-    # Amortise the single symbolic (assemble) cost over timed runs (run_id > 0),
-    # matching how Prisma amortises its symbolic pipeline.
-    n_timed = max(runs, 1)
-    amortised_sym_ms = (assemble_ns / 1e6) / n_timed
 
     result = []
     for run_id in range(runs + 1):
+        sym  = asm_ns.get(run_id, 0) / 1e6
         comp = comp_ns.get(run_id, 0) / 1e6
-        sym  = 0.0 if run_id == 0 else amortised_sym_ms
         result.append((sym, comp, sym + comp))
     return result
 
@@ -306,9 +314,19 @@ def run_prisma_spgemm(
     """Run prisma_cpu_bench with A=B=bsp (A×A) and return timing triples.
 
     Returns (triples, n_pairs, n_groups).  triples is [(sym_ms, compute_ms,
-    total_ms)] for run_id 0..runs.  sym_ms for run_id 0 (warmup) is 0.0;
-    for timed runs it is (pipe_total_ms + extra_sym_ms) / n_timed (amortised).
-    extra_sym_ms is the symbolic cost from a prior --print-shapes invocation.
+    total_ms)] for run_id 0..runs.  Every run redoes the full symbolic
+    pipeline (intersect -> merge -> fuse -> plan_build) from scratch inside
+    prisma_cpu_bench (see its main loop), so sym_ms is a real per-run
+    measurement, not one measurement divided by n_timed -- a cold, one-off
+    caller pays the full symbolic cost, and averaging N real measurements
+    reflects that honestly.
+
+    extra_sym_ms is a genuinely one-time cost from a prior --print-shapes
+    invocation (only nonzero for prisma_top10, which must analyse shapes once
+    before it can even compile its specialized kernel) -- unlike the per-run
+    symbolic cost above, that setup truly happens once regardless of n_timed,
+    so it alone is amortised (divided by n_timed) on top of each run's real
+    symbolic measurement.
     """
     if not bsp.exists():
         raise FileNotFoundError(f"BSP not found: {bsp}")
@@ -323,20 +341,23 @@ def run_prisma_spgemm(
     d = _parse_json_block(r.stdout)
     if not d:
         raise RuntimeError(f"prisma_cpu_bench: no JSON output:\n{r.stdout[-400:]}")
-    compute_ms = d.get("compute_ms")
-    if not compute_ms:
-        raise RuntimeError("prisma_cpu_bench: empty compute_ms in JSON")
+    compute_ms  = d.get("compute_ms")
+    symbolic_ms = d.get("symbolic_ms")
+    if not compute_ms or not symbolic_ms or len(compute_ms) != len(symbolic_ms):
+        raise RuntimeError(
+            "prisma_cpu_bench: missing/mismatched symbolic_ms or compute_ms in JSON"
+        )
 
-    pipe_total    = float(d.get("pipe_total_ms", 0.0)) + extra_sym_ms
-    n_pairs       = int(d.get("n_pairs",  0))
-    n_groups      = int(d.get("n_groups", 0))
-    n_timed       = max(len(compute_ms) - 1, 1)
-    amortised_sym = pipe_total / n_timed
+    n_pairs         = int(d.get("n_pairs",  0))
+    n_groups        = int(d.get("n_groups", 0))
+    n_timed         = max(len(compute_ms) - 1, 1)
+    amortised_extra = extra_sym_ms / n_timed
 
     triples = []
-    for run_id, c in enumerate(compute_ms):
-        sym = 0.0 if run_id == 0 else amortised_sym
-        triples.append((sym, float(c), sym + float(c)))
+    for s, c in zip(symbolic_ms, compute_ms):
+        sym  = float(s) + amortised_extra
+        comp = float(c)
+        triples.append((sym, comp, sym + comp))
 
     return triples, n_pairs, n_groups
 
@@ -511,8 +532,10 @@ def benchmark_matrix(
         for run_id, (s, c, t) in enumerate(triples):
             _emit(writer, f_csv, base, label, run_id, s, c, t, n_pairs, n_groups)
         timed = [t for _, _, t in triples[1:]] or [t for _, _, t in triples]
+        sym_timed = [s for s, _, _ in triples[1:]] or [s for s, _, _ in triples]
         print(f"avg {sum(timed)/len(timed):.3f} ms  "
-              f"(sym={triples[1][0]:.2f} ms amort, pairs={n_pairs}, groups={n_groups})")
+              f"(sym avg={sum(sym_timed)/len(sym_timed):.2f} ms, "
+              f"pairs={n_pairs}, groups={n_groups})")
 
     if run_generic:
         _run_prisma("prisma_generic", prisma_bin, specialized=False)

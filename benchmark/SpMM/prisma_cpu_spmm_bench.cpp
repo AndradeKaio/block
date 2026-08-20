@@ -126,176 +126,15 @@ int main(int argc, char **argv) {
   const int N = S.N; // square matrix: dense RHS is N×N
 
   // Structural setup: everything below that depends only on S's sparsity
-  // pattern (not on D or the run count), built once and reused across every
-  // run — the same category of one-time cost as TACO's pack_B(), which
-  // packs B's CSR structure once before ITS run loop too (see
-  // bench_taco_spmm.cpp). Neither this project's own harness nor TACO's
-  // ever measured this cost anywhere (no clock calls around either),
-  // despite both silently excluding it from every reported number. Timed
-  // explicitly here (and pack_B analogously in bench_taco_spmm.cpp) so a
-  // real question — is Prisma's one-time setup actually comparable to
-  // TACO's, or does it hide a cost that would matter for a single-shot
-  // (mine-once-run-once) caller rather than the amortized-many-runs case
-  // this benchmark's compute_ms otherwise reports — has a measured answer
-  // instead of an assumed one.
-  auto t_setup0 = Clock::now();
-
-  // Group blocks so each group owns a disjoint C row range → parallel across
-  // groups, serial within a group (no races).
-  // Sort by starting row, then sweep-merge: if a block's start row falls inside
-  // the current group's extent, it belongs to the same group.
-  struct RowGroup {
-    std::vector<int> block_ids;
-  };
-  std::vector<RowGroup> row_groups;
-  {
-    std::vector<int> order((int)S.blocks.size());
-    std::iota(order.begin(), order.end(), 0);
-    std::sort(order.begin(), order.end(),
-              [&](int a, int b) { return S.blocks[a].r < S.blocks[b].r; });
-    int group_end = -1;
-    for (int bi : order) {
-      const auto &blk = S.blocks[bi];
-      if (blk.r >= group_end) {
-        row_groups.push_back({});
-        group_end = blk.r + blk.h;
-      } else {
-        group_end = std::max(group_end, blk.r + blk.h);
-      }
-      row_groups.back().block_ids.push_back(bi);
-    }
-  }
-
-  // Reorder for D locality: block.c selects which rows of the huge N×N dense
-  // D operand a block reads (D doesn't fit in any cache for realistic N), and
-  // many blocks across different row groups share the same or nearby column
-  // range (mined block shapes repeat; empirically 3-13x more total block
-  // width than N on the matrices this was profiled against). The row-major
-  // grouping above interleaves column ranges arbitrarily, so consecutive
-  // groups — which land on the same or nearby threads under
-  // static/dynamic/tiled scheduling — usually pull unrelated D rows.
-  // Re-sort groups by mean block column (a pure reordering of independent,
-  // row-disjoint work items — doesn't change results) so groups worked on
-  // concurrently or back-to-back reference nearby D rows, improving L2/L3
-  // reuse. Also sort each group's own blocks by column for the same reason
-  // when a single thread walks them serially.
-  {
-    for (auto &g : row_groups)
-      std::sort(g.block_ids.begin(), g.block_ids.end(),
-                [&](int a, int b) { return S.blocks[a].c < S.blocks[b].c; });
-    std::sort(row_groups.begin(), row_groups.end(),
-              [&](const RowGroup &a, const RowGroup &b) {
-                double ca = 0, cb = 0;
-                for (int bi : a.block_ids)
-                  ca += S.blocks[bi].c;
-                for (int bi : b.block_ids)
-                  cb += S.blocks[bi].c;
-                ca /= (double)a.block_ids.size();
-                cb /= (double)b.block_ids.size();
-                return ca < cb;
-              });
-  }
-  const float row_group_setup_ms = ms_since(t_setup0);
-
-  // Strategy selection. --static and --tile-n remain explicit, independent
-  // overrides — kept as separate contenders in suite-sparse/validate_spmm.py
-  // for ablation, unchanged in meaning. --auto is the practical, deployable
-  // default: instead of a human picking the best-looking flag per matrix
-  // after the fact (which isn't something a real caller can do without
-  // already knowing the answer), it picks the strategy at runtime from
-  // signals the program already has. Gated behind an explicit flag rather
-  // than replacing the bare-invocation default so prisma_cpu/prisma_specialized
-  // keep meaning exactly what they already mean as ablation data points.
-  //
-  // The two signals are cheap (already-computed row-group sizes, plus N) and
-  // were fit against a profiling sweep across 28 SuiteSparse matrices:
-  //   - max_share: the largest row group's share of all blocks. High share
-  //     means the row-major sweep that builds row_groups collapsed most of
-  //     the matrix's work into one or few groups (heavy row-overlap between
-  //     mined blocks), which starves group-level parallelism no matter the
-  //     thread count (see the flat-task-list comment below) — tiling fixes
-  //     this and wins by a large margin whenever it applies (up to ~7x on
-  //     the matrices in the sweep with max_share above this cutoff).
-  //   - N: the tiled path's flat task list carries fixed bookkeeping
-  //     (building tasks.size() = groups × tiles entries, a dynamic-schedule
-  //     omp-for over it) that only pays for itself once the dense operand
-  //     is big enough that column tiling's L2/L3 reuse matters; below the
-  //     cutoff, row-group-level static scheduling has less overhead and
-  //     matched or beat tiling in the sweep (by up to ~1.8x on the smallest
-  //     matrices, where both strategies run in well under a millisecond and
-  //     bookkeeping cost is the whole story).
-  // Neither signal alone separates the sweep cleanly (e.g. a mid-size,
-  // mildly-imbalanced matrix can still favor static); the OR of both was
-  // the simplest rule that matched the empirically-best strategy on most of
-  // the 28. It missed one real case, though: olm1000/olm2000 both collapse
-  // to a SINGLE row group (max_share=1.0, every block) but sit under the
-  // N>2000 gate, so they fell through to static — which for a lone group
-  // means literally zero parallelism, not "less-than-ideal" parallelism,
-  // since there's no second group for another thread to pick up regardless
-  // of N. static's own bookkeeping-vs-N tradeoff (the comment above) doesn't
-  // apply here: there's no bookkeeping to save when the alternative is one
-  // thread doing 100% of the matrix serially. So severe collapse overrides
-  // the N gate entirely; the milder 0.10 threshold below still needs N>2000
-  // to be worth tiling's overhead.
-  const double kSevereCollapseCutoff = 0.5;
-  const double kImbalanceCutoff = 0.10;
-  const int kImbalanceMinN = 2000;
-  const int kSizeCutoffN = 4096;
-  double max_share = 0.0;
-  {
-    size_t max_group_blocks = 0;
-    for (const auto &g : row_groups)
-      max_group_blocks = std::max(max_group_blocks, g.block_ids.size());
-    if (!S.blocks.empty())
-      max_share = (double)max_group_blocks / (double)S.blocks.size();
-  }
-  const bool auto_mode =
-      args.auto_schedule && !args.use_static && args.tile_n == 0;
-  const bool auto_picks_tiled =
-      max_share > kSevereCollapseCutoff ||
-      (max_share > kImbalanceCutoff && N > kImbalanceMinN) || N >= kSizeCutoffN;
-  const bool use_tiled = args.tile_n > 0 || (auto_mode && auto_picks_tiled);
-  const bool use_static_sched =
-      args.use_static || (auto_mode && !auto_picks_tiled);
-  if (auto_mode)
-    std::fprintf(stderr, "auto: max_share=%.3f N=%d -> %s\n", max_share, N,
-                 use_tiled ? "tiled" : "static");
-
-  // Flat (group, column-tile) task list for the tiled strategy below.
-  // Built once, outside the timed loop, alongside row_groups (same
-  // rationale: fixed structure, no per-run rework).
-  //
-  // Why this can't just be "for each tile, omp-for over groups" (nested the
-  // other way, as a first attempt had it): row_groups only guarantees
-  // *row*-disjointness, and for matrices with heavy row-overlap between
-  // mined blocks, the merge sweep above can collapse almost everything into
-  // one or two groups (measured: linverse collapses to a SINGLE group of
-  // 5999 blocks; bundle1 puts 61% of its blocks in one group of 8). Nesting
-  // an omp-for over groups *inside* a serial tile loop pins every tile of
-  // such a group to the same thread (schedule(static) deterministically
-  // maps a lone iteration to the same thread every time), so a dominant
-  // group gets zero parallelism no matter the thread count — confirmed:
-  // both matrices showed flat wall-clock time from 4 to 64 threads.
-  // Flattening to one task per (group, tile) and parallelizing over the
-  // flat list lets a single group's column range split across many
-  // threads: different tiles of the same group touch disjoint C columns,
-  // so they're safe to run concurrently; only blocks *within* one
-  // (group, tile) task must stay serial (they can share output columns).
-  struct Task {
-    int gi, j, t;
-  };
-  std::vector<Task> tasks;
-  auto t_tasklist0 = Clock::now();
-  if (use_tiled) {
-    const int T = args.tile_n > 0 ? args.tile_n : 512;
-    int n_tiles = (N + T - 1) / T;
-    tasks.reserve((size_t)row_groups.size() * n_tiles);
-    for (int gi = 0; gi < (int)row_groups.size(); ++gi)
-      for (int j = 0; j < N; j += T)
-        tasks.push_back({gi, j, std::min(T, N - j)});
-  }
-  const float task_list_setup_ms = ms_since(t_tasklist0);
-  const float structural_setup_ms = row_group_setup_ms + task_list_setup_ms;
+  // pattern (not on D) is redone from scratch on every timed run, inside the
+  // loop below — a real, one-off caller who invokes SpMM once pays this cost
+  // every single time, not once amortised across many calls. Previously this
+  // was built ONCE outside the run loop and that single measurement was
+  // re-reported on every row (misrepresenting a one-shot cost as free on
+  // every subsequent call); now symbolic_ms is a genuine per-run
+  // measurement, matching the same fix applied to Prisma's SpGEMM symbolic
+  // pipeline (see SpGEMM/CPU/prisma_cpu_bench.cpp) and to TACO's own
+  // pack_B() (see bench_taco_spmm.cpp, which now re-packs B every run too).
 
 #ifdef _OPENMP
   // Thread count: this workload is fork-join- and memory-bandwidth-bound
@@ -362,63 +201,186 @@ int main(int argc, char **argv) {
   symbolic_ms_arr.reserve(args.runs + 1);
   compute_ms_arr.reserve(args.runs + 1);
 
-  {
-    std::vector<int> sizes;
-    sizes.reserve(row_groups.size());
-    for (const auto &g : row_groups)
-      sizes.push_back((int)g.block_ids.size());
-    std::sort(sizes.begin(), sizes.end());
+  float last_row_group_setup_ms = 0.0f, last_task_list_setup_ms = 0.0f,
+        last_structural_setup_ms = 0.0f;
 
-    long long total = 0;
-    for (int s : sizes)
-      total += s;
-
-    int n = (int)sizes.size();
-    std::fprintf(
-        stderr,
-        "row_groups: count=%d  blocks=%lld  "
-        "min=%d  p25=%d  median=%d  p75=%d  p95=%d  max=%d  mean=%.2f\n",
-        n, total, sizes[0], sizes[n * 25 / 100], sizes[n * 50 / 100],
-        sizes[n * 75 / 100], sizes[n * 95 / 100], sizes[n - 1],
-        (double)total / n);
-
-    // Row-overlap depth: for each C row, count how many blocks cover it.
-    // max_depth = minimum number of serial passes any correct parallel schedule
-    // needs.
-    std::vector<int> depth(M, 0);
-    for (const auto &blk : S.blocks)
-      for (int ri = 0; ri < blk.h; ++ri)
-        depth[blk.r + ri]++;
-    int max_depth = *std::max_element(depth.begin(), depth.end());
-    long long contested_rows = 0;
-    for (int d : depth)
-      if (d > 1)
-        ++contested_rows;
-    int max_h = 0;
-    for (const auto &blk : S.blocks)
-      max_h = std::max(max_h, blk.h);
-    std::fprintf(
-        stderr,
-        "overlap: max_block_h=%d  max_depth=%d  contested_rows=%lld/%d\n",
-        max_h, max_depth, contested_rows, M);
-  }
-  std::fprintf(stderr,
-               "structural_setup: bsp_read=%.4fms  row_group=%.4fms  "
-               "task_list=%.4fms  total(excl. read)=%.4fms\n",
-               bsp_read_ms, row_group_setup_ms, task_list_setup_ms,
-               structural_setup_ms);
-  // row_groups (block→disjoint-row-range assignment) depends only on S's
-  // sparsity structure, which is fixed across all runs — build it once here,
-  // outside the timed loop, exactly as TACO packs B's CSR structure once
-  // before its run loop (pack_B, called before any assemble/compute timing
-  // starts). Redoing this sort+sweep on every run would time work that a
-  // real caller doing repeated SpMM against the same S would never repeat.
   for (int r = 0; r <= args.runs; ++r) {
+    // Group blocks so each group owns a disjoint C row range → parallel
+    // across groups, serial within a group (no races). Redone from scratch
+    // every run (see the top-of-function comment) instead of being built
+    // once and reused: sort by starting row, then sweep-merge — if a
+    // block's start row falls inside the current group's extent, it
+    // belongs to the same group.
+    auto t_setup0 = Clock::now();
+    struct RowGroup {
+      std::vector<int> block_ids;
+    };
+    std::vector<RowGroup> row_groups;
+    {
+      std::vector<int> order((int)S.blocks.size());
+      std::iota(order.begin(), order.end(), 0);
+      std::sort(order.begin(), order.end(),
+                [&](int a, int b) { return S.blocks[a].r < S.blocks[b].r; });
+      int group_end = -1;
+      for (int bi : order) {
+        const auto &blk = S.blocks[bi];
+        if (blk.r >= group_end) {
+          row_groups.push_back({});
+          group_end = blk.r + blk.h;
+        } else {
+          group_end = std::max(group_end, blk.r + blk.h);
+        }
+        row_groups.back().block_ids.push_back(bi);
+      }
+    }
+
+    // Reorder for D locality: block.c selects which rows of the huge N×N
+    // dense D operand a block reads (D doesn't fit in any cache for
+    // realistic N), and many blocks across different row groups share the
+    // same or nearby column range (mined block shapes repeat; empirically
+    // 3-13x more total block width than N on the matrices this was
+    // profiled against). The row-major grouping above interleaves column
+    // ranges arbitrarily, so consecutive groups — which land on the same or
+    // nearby threads under static/dynamic/tiled scheduling — usually pull
+    // unrelated D rows. Re-sort groups by mean block column (a pure
+    // reordering of independent, row-disjoint work items — doesn't change
+    // results) so groups worked on concurrently or back-to-back reference
+    // nearby D rows, improving L2/L3 reuse. Also sort each group's own
+    // blocks by column for the same reason when a single thread walks them
+    // serially.
+    {
+      for (auto &g : row_groups)
+        std::sort(g.block_ids.begin(), g.block_ids.end(),
+                  [&](int a, int b) { return S.blocks[a].c < S.blocks[b].c; });
+      std::sort(row_groups.begin(), row_groups.end(),
+                [&](const RowGroup &a, const RowGroup &b) {
+                  double ca = 0, cb = 0;
+                  for (int bi : a.block_ids)
+                    ca += S.blocks[bi].c;
+                  for (int bi : b.block_ids)
+                    cb += S.blocks[bi].c;
+                  ca /= (double)a.block_ids.size();
+                  cb /= (double)b.block_ids.size();
+                  return ca < cb;
+                });
+    }
+    const float row_group_setup_ms = ms_since(t_setup0);
+
+    // Strategy selection. --static and --tile-n remain explicit, independent
+    // overrides; --auto picks the strategy at runtime from two cheap
+    // signals (max_share, N) fit against a profiling sweep across 28
+    // SuiteSparse matrices — see the version history for the full
+    // rationale. Recomputed every run alongside row_groups since it depends
+    // on max_share (derived from row_groups); the decision itself is
+    // invariant across runs (same S every time), only the measurement is
+    // now genuinely fresh.
+    const double kSevereCollapseCutoff = 0.5;
+    const double kImbalanceCutoff = 0.10;
+    const int kImbalanceMinN = 2000;
+    const int kSizeCutoffN = 4096;
+    double max_share = 0.0;
+    {
+      size_t max_group_blocks = 0;
+      for (const auto &g : row_groups)
+        max_group_blocks = std::max(max_group_blocks, g.block_ids.size());
+      if (!S.blocks.empty())
+        max_share = (double)max_group_blocks / (double)S.blocks.size();
+    }
+    const bool auto_mode =
+        args.auto_schedule && !args.use_static && args.tile_n == 0;
+    const bool auto_picks_tiled =
+        max_share > kSevereCollapseCutoff ||
+        (max_share > kImbalanceCutoff && N > kImbalanceMinN) ||
+        N >= kSizeCutoffN;
+    const bool use_tiled = args.tile_n > 0 || (auto_mode && auto_picks_tiled);
+    const bool use_static_sched =
+        args.use_static || (auto_mode && !auto_picks_tiled);
+    if (auto_mode && r == 0)
+      std::fprintf(stderr, "auto: max_share=%.3f N=%d -> %s\n", max_share, N,
+                   use_tiled ? "tiled" : "static");
+
+    // Flat (group, column-tile) task list for the tiled strategy below.
+    // Why this can't just be "for each tile, omp-for over groups" (nested
+    // the other way, as a first attempt had it): row_groups only guarantees
+    // *row*-disjointness, and for matrices with heavy row-overlap between
+    // mined blocks, the merge sweep above can collapse almost everything
+    // into one or two groups (measured: linverse collapses to a SINGLE
+    // group of 5999 blocks; bundle1 puts 61% of its blocks in one group of
+    // 8). Nesting an omp-for over groups *inside* a serial tile loop pins
+    // every tile of such a group to the same thread (schedule(static)
+    // deterministically maps a lone iteration to the same thread every
+    // time), so a dominant group gets zero parallelism no matter the thread
+    // count — confirmed: both matrices showed flat wall-clock time from 4
+    // to 64 threads. Flattening to one task per (group, tile) and
+    // parallelizing over the flat list lets a single group's column range
+    // split across many threads: different tiles of the same group touch
+    // disjoint C columns, so they're safe to run concurrently; only blocks
+    // *within* one (group, tile) task must stay serial (they can share
+    // output columns).
+    struct Task {
+      int gi, j, t;
+    };
+    std::vector<Task> tasks;
+    auto t_tasklist0 = Clock::now();
+    if (use_tiled) {
+      const int T = args.tile_n > 0 ? args.tile_n : 512;
+      int n_tiles = (N + T - 1) / T;
+      tasks.reserve((size_t)row_groups.size() * n_tiles);
+      for (int gi = 0; gi < (int)row_groups.size(); ++gi)
+        for (int j = 0; j < N; j += T)
+          tasks.push_back({gi, j, std::min(T, N - j)});
+    }
+    const float task_list_setup_ms = ms_since(t_tasklist0);
+    const float structural_setup_ms = row_group_setup_ms + task_list_setup_ms;
+
+    if (r == 0) {
+      std::vector<int> sizes;
+      sizes.reserve(row_groups.size());
+      for (const auto &g : row_groups)
+        sizes.push_back((int)g.block_ids.size());
+      std::sort(sizes.begin(), sizes.end());
+
+      long long total = 0;
+      for (int s : sizes)
+        total += s;
+
+      int n = (int)sizes.size();
+      std::fprintf(
+          stderr,
+          "row_groups: count=%d  blocks=%lld  "
+          "min=%d  p25=%d  median=%d  p75=%d  p95=%d  max=%d  mean=%.2f\n",
+          n, total, sizes[0], sizes[n * 25 / 100], sizes[n * 50 / 100],
+          sizes[n * 75 / 100], sizes[n * 95 / 100], sizes[n - 1],
+          (double)total / n);
+
+      // Row-overlap depth: for each C row, count how many blocks cover it.
+      // max_depth = minimum number of serial passes any correct parallel
+      // schedule needs.
+      std::vector<int> depth(M, 0);
+      for (const auto &blk : S.blocks)
+        for (int ri = 0; ri < blk.h; ++ri)
+          depth[blk.r + ri]++;
+      int max_depth = *std::max_element(depth.begin(), depth.end());
+      long long contested_rows = 0;
+      for (int d : depth)
+        if (d > 1)
+          ++contested_rows;
+      int max_h = 0;
+      for (const auto &blk : S.blocks)
+        max_h = std::max(max_h, blk.h);
+      std::fprintf(
+          stderr,
+          "overlap: max_block_h=%d  max_depth=%d  contested_rows=%lld/%d\n",
+          max_h, max_depth, contested_rows, M);
+      std::fprintf(
+          stderr,
+          "structural_setup (per run): bsp_read=%.4fms  row_group=%.4fms  "
+          "task_list=%.4fms  total(excl. read)=%.4fms\n",
+          bsp_read_ms, row_group_setup_ms, task_list_setup_ms,
+          structural_setup_ms);
+    }
+
     auto t0 = Clock::now();
-    // No incremental symbolic work per run (structure built once above) —
-    // mirrors TACO's assemble(), whose per-run cost is likewise ~0 for a
-    // fixed B.
-    auto t1 = Clock::now();
 
     // Zero C inside the timed compute region: this is real, unavoidable
     // per-run cost (accumulating blocks need a zeroed target) and TACO pays
@@ -491,9 +453,15 @@ int main(int argc, char **argv) {
       }
     }
 
-    auto t2 = Clock::now();
-    symbolic_ms_arr.push_back(ms_between(t0, t1));
-    compute_ms_arr.push_back(ms_between(t1, t2));
+    auto t1 = Clock::now();
+    symbolic_ms_arr.push_back((double)structural_setup_ms);
+    compute_ms_arr.push_back((double)ms_between(t0, t1));
+
+    if (r == args.runs) {
+      last_row_group_setup_ms = row_group_setup_ms;
+      last_task_list_setup_ms = task_list_setup_ms;
+      last_structural_setup_ms = structural_setup_ms;
+    }
   }
 
   // Optionally dump C (M×N row-major doubles) for external validation
@@ -510,16 +478,15 @@ int main(int argc, char **argv) {
 
   std::printf("\nJSON_BEGIN\n{\n");
   std::printf("  \"kernel\": \"prisma_cpu_spmm\",\n");
-  // pipe_total_ms: one-time structural setup (row-group build + D-locality
-  // resort + flat task-list build, if tiled) — done once, NOT re-timed per
-  // run, same category of cost as TACO's pack_B() (see this measurement's
-  // introduction above). Previously hardcoded to 0.0 (never actually
-  // measured); now real, so this is comparable to TACO's own pack_B time
-  // if that's measured and reported the same way.
-  std::printf("  \"pipe_total_ms\": %.4f,\n", structural_setup_ms);
+  // pipe_total_ms / row_group_setup_ms / task_list_setup_ms below report the
+  // LAST run's structural-setup measurement (see last_structural_setup_ms
+  // etc., stashed inside the loop) purely for diagnostic display — the
+  // real per-run values consumers should use are symbolic_ms below, one
+  // genuine measurement per run, not a single one-time cost re-reported.
+  std::printf("  \"pipe_total_ms\": %.4f,\n", last_structural_setup_ms);
   std::printf("  \"bsp_read_ms\": %.4f,\n", bsp_read_ms);
-  std::printf("  \"row_group_setup_ms\": %.4f,\n", row_group_setup_ms);
-  std::printf("  \"task_list_setup_ms\": %.4f,\n", task_list_setup_ms);
+  std::printf("  \"row_group_setup_ms\": %.4f,\n", last_row_group_setup_ms);
+  std::printf("  \"task_list_setup_ms\": %.4f,\n", last_task_list_setup_ms);
   std::printf("  \"S_blocks\": %zu,\n", S.blocks.size());
   std::printf("  \"S_rows\": %d, \"S_cols\": %d,\n", M, N);
   if (!shape_freq.empty()) {

@@ -56,7 +56,7 @@ KERNEL_DISPLAY = {
 DEFAULT_COLOR = "#7f7f7f"
 
 # ---------------------------------------------------------------------------
-# Data loading  (identical logic to plot_gpu.py)
+# Data loading  (identical logic to suite-sparse/plot_spgemm_gpu.py)
 # ---------------------------------------------------------------------------
 
 _NUMERIC = [

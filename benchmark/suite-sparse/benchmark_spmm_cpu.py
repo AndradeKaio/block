@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """
-suite-sparse/benchmark_spmm.py — SpMM benchmark on real SuiteSparse matrices.
+suite-sparse/benchmark_spmm_cpu.py — SpMM benchmark on real SuiteSparse matrices.
 
 Computes C = S * D where S is loaded from MTX and D is an in-memory N×N
 random dense matrix (N = number of columns of S; matrices are always square).
-Timing is split into symbolic (assemble) and compute phases, one row per run.
+Timing is split into symbolic and compute phases, one row per run.
 run_id=0 is the warmup run; timed runs are run_id=1..R.
 
+The symbolic phase (TACO's pack_B(); Prisma's row-group build + D-locality
+resort + task-list build) is redone from scratch on every timed run, not
+built once and amortized -- a one-off caller pays the full symbolic cost on
+every call, so symbolic_ms is a mean of R real per-run measurements.
+
 Usage:
-  python benchmark_spmm.py matrices.csv
-  python benchmark_spmm.py matrices.csv --out spmm_results.csv --runs 5
-  python benchmark_spmm.py matrices.csv --no-compile --bin /path/to/bench_taco_spmm
+  python benchmark_spmm_cpu.py matrices.csv
+  python benchmark_spmm_cpu.py matrices.csv --out spmm_results.csv --runs 5
+  python benchmark_spmm_cpu.py matrices.csv --no-compile --bin /path/to/bench_taco_spmm
 """
 
 import argparse
@@ -645,6 +650,13 @@ def run_prisma_cpu_spmm(
     compute_ms = d.get("compute_ms", [])
     if not compute_ms:
         raise RuntimeError("prisma_cpu_spmm: empty compute_ms in JSON")
+    # symbolic_ms is the block-grouping/dispatch-prep cost (row-group build +
+    # D-locality resort + task-list build) -- redone from scratch on every
+    # timed run inside prisma_cpu_spmm_bench.cpp's main loop, so this is a
+    # real per-run measurement, not a single one-shot cost re-reported. A
+    # real, one-off caller pays this cost every call; TACO's own pack_B()
+    # (bench_taco_spmm.cpp) is redone every run the same way, folded into
+    # run_%d_assemble_ns.
     symbolic_ms = d.get("symbolic_ms", [0.0] * len(compute_ms))
     return [(sym, comp, sym + comp) for sym, comp in zip(symbolic_ms, compute_ms)]
 

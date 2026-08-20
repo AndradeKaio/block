@@ -83,12 +83,39 @@ static long ns_now(void) {
   return (long)ts.tv_sec * 1000000000L + ts.tv_nsec;
 }
 
+/* Dump the computed A (CSR: mode 0 dense/row, mode 1 sparse/col) as bare
+   "row col val" COO text, 0-indexed -- same format prisma_cpu_bench.cpp's
+   --validate writes, so validate_spgemm_cpu.py's existing _load_coo can
+   read either contender's output identically. */
+static void dump_csr_coo(const char *path, taco_tensor_t *A, int M) {
+  FILE *f = fopen(path, "w");
+  if (!f) {
+    fprintf(stderr, "bench_taco: cannot open dump-c path: %s\n", path);
+    return;
+  }
+  const int *row_ptr = (const int *)A->indices[1][0];
+  const int *col_idx = (const int *)A->indices[1][1];
+  const double *vals = (const double *)A->vals;
+  for (int i = 0; i < M; i++) {
+    for (int k = row_ptr[i]; k < row_ptr[i + 1]; k++) {
+      fprintf(f, "%d %d %.17g\n", i, col_idx[k], vals[k]);
+    }
+  }
+  fclose(f);
+}
+
 int main(int argc, char *argv[]) {
   if (argc < 3) {
-    fprintf(stderr, "usage: %s A.mtx B.mtx [n_runs]\n", argv[0]);
+    fprintf(stderr, "usage: %s A.mtx B.mtx [n_runs] [--dump-c path]\n", argv[0]);
     return 1;
   }
-  int n = argc > 3 ? atoi(argv[3]) : 1;
+  int n = argc > 3 && argv[3][0] != '-' ? atoi(argv[3]) : 1;
+  const char *dump_c_path = NULL;
+  for (int i = 3; i < argc; i++) {
+    if (strcmp(argv[i], "--dump-c") == 0 && i + 1 < argc) {
+      dump_c_path = argv[++i];
+    }
+  }
 
   int M, K, K2, N, B_nnz, C_nnz;
   int *Br, *Bc, *Cr, *Cc;
@@ -111,31 +138,39 @@ int main(int argc, char *argv[]) {
   pack_B(B_t, Bp, Br, Bc, Bv);
   pack_C(C_t, Cp, Cr, Cc, Cv);
 
-  /* Symbolic phase (assemble) runs once — determines output sparsity pattern.
-     Timing it separately lets the timed loop measure compute in isolation,
-     matching how Prisma amortises its symbolic pipeline. */
-  long sym_t0 = ns_now();
-  assemble(A_t, B_t, C_t);
-  long sym_ns = ns_now() - sym_t0;
-  int A_nnz = ((int *)A_t->indices[1][0])[M];
-  printf("assemble_ns=%ld\n", sym_ns);
-  printf("A_nnz=%d\n", A_nnz);
-  fflush(stdout);
-
-  /* Warmup compute (run_id 0), then n-1 timed runs.
-     Zero vals before each call so repeated compute gives correct results. */
-  long c_total = 0;
+  /* Every run redoes assemble() from scratch (freeing and reallocating A_t's
+     output arrays first via reset_out) instead of assembling once and
+     reusing the pattern -- matches prisma_cpu_bench.cpp's equivalent change.
+     A caller who invokes SpGEMM once pays the full assemble() cost, not an
+     artificially amortised fraction of it; averaging N real measurements
+     (which benchmark_spgemm_cpu.py's plot does via a plain mean) reflects
+     that honestly. */
+  long sym_total = 0, c_total = 0;
+  int A_nnz = 0;
   for (int r = 0; r < n; r++) {
-    memset(A_t->vals, 0, (size_t)A_nnz * sizeof(double));
+    if (r > 0)
+      reset_out(A_t);
     long t0 = ns_now();
+    assemble(A_t, B_t, C_t);
+    long sym = ns_now() - t0;
+    sym_total += sym;
+    A_nnz = ((int *)A_t->indices[1][0])[M];
+    memset(A_t->vals, 0, (size_t)A_nnz * sizeof(double));
+    long t1 = ns_now();
     compute(A_t, B_t, C_t);
-    long c = ns_now() - t0;
+    long c = ns_now() - t1;
     c_total += c;
+    printf("run_%d_assemble_ns=%ld\n", r, sym);
     printf("run_%d_compute_ns=%ld\n", r, c);
     fflush(stdout);
   }
 
+  printf("A_nnz=%d\n", A_nnz);
+  printf("mean_assemble_ns=%ld\n", sym_total / n);
   printf("mean_compute_ns=%ld\n", c_total / n);
+
+  if (dump_c_path)
+    dump_csr_coo(dump_c_path, A_t, M);
 
   free(Br);
   free(Bc);

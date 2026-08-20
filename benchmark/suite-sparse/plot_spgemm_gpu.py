@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-plot_gpu.py — Plot suite-sparse GPU benchmark results.
+suite-sparse/plot_spgemm_gpu.py — Plot suite-sparse GPU SpGEMM benchmark results.
+
+Renamed from plot_gpu.py (the title below always said "SpGEMM" — the old
+filename just didn't say so) to sit alongside plot_spmm_gpu.py under a
+consistent <benchmark>_<precision>.py naming scheme.
 
 X-axis : matrices ordered by NNZ (ascending)
 Y-axis : average total_ms across timed runs
 Columns: one bar group per matrix, one color per contender
 
 Usage:
-  python plot_gpu.py --file suite_sparse_results.csv
-  python plot_gpu.py --file results.csv --warmup --out plot.html
+  python plot_spgemm_gpu.py --file suite_sparse_results.csv
+  python plot_spgemm_gpu.py --file results.csv --warmup --out plot.html
 """
 
 import argparse
@@ -49,10 +53,15 @@ DEFAULT_COLOR = "#7f7f7f"
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Plot suite-sparse GPU benchmark results.",
+        description="Plot suite-sparse GPU SpGEMM benchmark results.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--file", required=True, help="Benchmark CSV produced by benchmark_gpu.py")
+    p.add_argument("--file", required=True,
+                   help="Benchmark CSV produced by benchmark_spgemm_gpu.py "
+                        "(a SuiteSparse-matrix GPU SpGEMM benchmark driver -- "
+                        "currently missing from this repo; SpGEMM/GPU/sweep.py "
+                        "benchmarks synthetic matrices with a different CSV "
+                        "schema and can't feed this script)")
     p.add_argument("--warmup", action="store_true", default=False,
                    help="Include warmup run (run_id == 0) in the average")
     p.add_argument("--out", default=None,

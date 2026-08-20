@@ -8,7 +8,7 @@ loaded from a .bsp and D is an in-memory N×N random dense matrix. Two
 precision lanes, both from the same binary via --precision:
   prisma_gpu_cuda_fp64  (primary — matches the CPU kernels' double precision)
   prisma_gpu_cuda_fp32  (secondary — never blended into the fp64 comparison;
-                         validate_spmm.py's existing relaxed cross-precision
+                         validate_spmm_gpu.py's existing relaxed cross-precision
                          tolerance applies)
 
 Also compiles/runs the cuSPARSE SpMM baseline (SpMM/GPU/cusparse_spmm_bench.cu)
@@ -17,15 +17,15 @@ lane reads -- a single pooled binary (no per-matrix specialization, unlike
 Prisma), compiled once via compile_cusparse_bench and reused across every
 matrix, mirroring TACO's own single-pooled-binary pattern. See --no-cusparse.
 
-A separate file from benchmark_spmm.py (which reuses `find_mtx`,
+A separate file from benchmark_spmm_cpu.py (which reuses `find_mtx`,
 `load_matrix_list`, `analyze_bsp_shapes` from it) rather than folded in, the
 same way SpGEMM's GPU benchmark (benchmark_gpu.py) is separate from its CPU
 one: the compile path here is inherently nvcc-only (cuda-home/arch flags,
-.cu sources), and benchmark_spmm.py must keep working on a GPU-less box —
+.cu sources), and benchmark_spmm_cpu.py must keep working on a GPU-less box —
 this file simply isn't runnable there, which is made explicit through
 --no-compile's clean-skip behavior rather than silently broken imports.
 
-Mirrors benchmark_spmm.py's per-matrix, per-matrix-specialized-binary
+Mirrors benchmark_spmm_cpu.py's per-matrix, per-matrix-specialized-binary
 structure (see compile_prisma_gpu_for_matrix below, itself mirroring
 compile_prisma_for_matrix) — one prisma_gpu_spmm_bench_<name> binary per
 matrix, specialized to that matrix's own top-N block shapes via
@@ -56,7 +56,7 @@ _CORE_DIR = _SCRIPT_DIR.parent / "core"
 _TMP_DIR = Path("/tmp/_prismac/")
 
 sys.path.insert(0, str(_SCRIPT_DIR))
-from benchmark_spmm import (  # noqa: E402  (path must be set up first)
+from benchmark_spmm_cpu import (  # noqa: E402  (path must be set up first)
     _fmt,
     _hdf5_paths,
     _needs_header,
@@ -147,7 +147,7 @@ def compile_prisma_gpu_for_matrix(
     rank_by_flops: bool = True,
 ) -> tuple[str, Path | None, str]:
     """Compile a prisma_gpu_spmm_bench specialized to ONE matrix's own top-N
-    block shapes. Mirrors benchmark_spmm.py's compile_prisma_for_matrix —
+    block shapes. Mirrors benchmark_spmm_cpu.py's compile_prisma_for_matrix —
     see that function's docstring for the FLOP-coverage rationale, which
     applies identically here.
 
@@ -224,7 +224,7 @@ def compile_prisma_gpu_per_matrix(
     max_workers: int = 12,
 ) -> dict[str, Path]:
     """Compile one matrix-specialized prisma_gpu binary per matrix, in
-    parallel. Mirrors benchmark_spmm.py's compile_prisma_per_matrix."""
+    parallel. Mirrors benchmark_spmm_cpu.py's compile_prisma_per_matrix."""
     build_root = bin_dir / "_prisma_gpu_build"
     build_root.mkdir(parents=True, exist_ok=True)
 
@@ -276,7 +276,7 @@ def compile_cusparse_bench(bin_dir: Path, cuda_home: str, arch: str) -> Path | N
     cuSPARSE has no per-matrix kernel-specialization step (no
     gen_spmm_gpu_kernels.py analog: it's a vendor library call, not
     generated code), so this is a single pooled binary reused across every
-    matrix, the same pattern benchmark_spmm.py's compile_binary uses for
+    matrix, the same pattern benchmark_spmm_cpu.py's compile_binary uses for
     TACO -- just via nvcc/-lcusparse instead of g++.
 
     Returns None (not raise) on failure so the caller can report and
@@ -380,7 +380,7 @@ def benchmark_matrix_prisma_gpu(
     spmm_gpu_plan.hpp's RowGroupTask/RowGroupItem). Brand-new, untested on
     real hardware as of 2026-08-15 -- deliberately NOT wired into main()'s
     default loop either, until it's been validated
-    (suite-sparse/validate_spmm.py's prisma_gpu_cuda_fp64_row_group row)
+    (suite-sparse/validate_spmm_gpu.py's prisma_gpu_cuda_fp64_row_group row)
     on real hardware. Call this directly with row_group=True once that's
     clean."""
     bsp = mtx.with_suffix(".bsp")
@@ -638,7 +638,7 @@ def parse_args():
         type=int,
         default=42,
         help="RNG seed for D generation (default 42) -- must match "
-        "validate_spmm.py / other contenders for cross-comparison",
+        "validate_spmm_gpu.py / other contenders for cross-comparison",
     )
     g.add_argument(
         "--timeout",
@@ -723,7 +723,7 @@ def parse_args():
         help="ALSO benchmark the --row-group alternative CUDA-fallback "
         "dispatch (prisma_gpu_cuda_fp64_row_group / _fp32_row_group), "
         "alongside the base lane -- brand-new, validate correctness via "
-        "validate_spmm.py's prisma_gpu_cuda_fp64_row_group row before "
+        "validate_spmm_gpu.py's prisma_gpu_cuda_fp64_row_group row before "
         "trusting these timings",
     )
     g.add_argument("--cuda-home", default="/usr/local/cuda")

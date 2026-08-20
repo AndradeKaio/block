@@ -11,7 +11,8 @@
 //   path  write the M×K output A as raw doubles to this file after the last run
 //
 // Output:
-//   run_N_assemble_ns=<long>
+//   run_N_assemble_ns=<long>  (includes pack_B, redone fresh every run --
+//                              see pack_B's call site below for why)
 //   run_N_compute_ns=<long>
 //   ...
 //   mean_assemble_ns=<long>   (runs 1..R, warmup excluded)
@@ -144,6 +145,12 @@ static void reset_output(taco_tensor_t *A) {
     if (A->vals) { free(A->vals); A->vals = NULL; }
 }
 
+static void reset_sparse(taco_tensor_t *B) {
+    if (B->indices[1][0]) { free(B->indices[1][0]); B->indices[1][0] = NULL; }
+    if (B->indices[1][1]) { free(B->indices[1][1]); B->indices[1][1] = NULL; }
+    if (B->vals)          { free(B->vals);          B->vals = NULL; }
+}
+
 static long ns_now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -178,19 +185,19 @@ int main(int argc, char *argv[]) {
 
     int K = N;
 
-    // pack_B is TACO's one-time structural setup (builds B's CSR index
-    // structure from the COO triples read above), done once before the
-    // run loop, same category of cost as prisma_cpu_spmm_bench's row-group
-    // build — see that file's matching instrumentation, added at the same
-    // time so the two numbers are directly comparable instead of both
-    // being silently excluded from every reported number as before.
+    // pack_B is TACO's structural setup (builds B's CSR index structure from
+    // the COO triples read above) — the same category of cost as Prisma's
+    // row-group build (prisma_cpu_spmm_bench.cpp). Redone from scratch every
+    // run inside the loop below (freeing the prior B_t index/vals arrays via
+    // reset_sparse first) instead of once before the loop: a real, one-off
+    // caller pays this cost every call, not once amortised across many.
+    // Folded into the reported assemble_ns per run so it isn't silently
+    // dropped from every number the way it previously was (this file used
+    // to measure pack_b_ns once but never fed it into run_%d_assemble_ns,
+    // which the Python driver's regex is the only thing that reads).
     taco_tensor_t *B_t = make_sparse(M, K);
     int Sp[2] = {0, S_nnz};
-    long t_pack0 = ns_now();
-    pack_B(B_t, Sp, Sr, Sc, Sv);
-    long pack_b_ns = ns_now() - t_pack0;
-    fprintf(stderr, "structural_setup: mtx_read=%.4fms  pack_b=%.4fms\n",
-           mtx_read_ns / 1e6, pack_b_ns / 1e6);
+    fprintf(stderr, "mtx_read=%.4fms\n", mtx_read_ns / 1e6);
 
     // Dense input C (K×K), same RNG as prisma_cpu_spmm_bench: mt19937_64
     taco_tensor_t *C_t = make_dense(K, K);
@@ -209,13 +216,18 @@ int main(int argc, char *argv[]) {
     int A_nnz = 0;
 
     for (int r = 0; r <= n_runs; r++) {
+        if (r > 0) reset_sparse(B_t);
+        long tpb0 = ns_now();
+        pack_B(B_t, Sp, Sr, Sc, Sv);
+        long pack_b_ns = ns_now() - tpb0;
+
         reset_output(A_t);
         long t0 = ns_now();
         assemble(A_t, B_t, C_t);
         long t1 = ns_now();
         compute(A_t, B_t, C_t);
         long t2 = ns_now();
-        long a = t1 - t0, c = t2 - t1;
+        long a = pack_b_ns + (t1 - t0), c = t2 - t1;
         if (r > 0) { a_total += a; c_total += c; }
         if (r == 0) A_nnz = M * K;
         printf("run_%d_assemble_ns=%ld\n", r, a);
@@ -237,7 +249,6 @@ int main(int argc, char *argv[]) {
     printf("mean_assemble_ns=%ld\n", a_total / n_runs);
     printf("mean_compute_ns=%ld\n",  c_total / n_runs);
     printf("mtx_read_ns=%ld\n", mtx_read_ns);
-    printf("pack_b_ns=%ld\n",   pack_b_ns);
     printf("S_nnz=%d\n",    S_nnz);
     printf("S_rows=%d\n",   M);
     printf("S_cols=%d\n",   N);

@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 """
 gen_spgemm_kernels.py — Generate named-register AVX-512/AVX2 specializations
-of gemm_fixed<M,K,N,float> and the DISPATCH() include file.
+of gemm_fixed<M,K,N,double> and the DISPATCH() include file.
+
+Double precision throughout — Prisma SpGEMM CPU (prisma_cpu_bench.cpp's
+Scalar) is double, matching TACO's own bench_taco.c (both Bv/Cv/A_t->vals
+are `double`), so the two are actually comparable at a tight tolerance
+instead of only "within float32 precision". Previously this generator
+targeted float (_ps intrinsics, 16/8/4-wide lanes); this is a full rewrite
+to _pd intrinsics with the correspondingly narrower lane widths (double is
+twice the width of float per SIMD register, so half as many fit per
+vector: 8/4/2 instead of 16/8/4).
 
 Two outputs (always written together, same directory):
   spgemm_kernels_generated.hpp  — template specializations with named registers
@@ -24,17 +33,17 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 def _isa_for_n(n: int) -> tuple[str, int]:
-    """Return (isa_tag, lane_floats) for the widest SIMD that fits N.
+    """Return (isa_tag, lane_doubles) for the widest SIMD that fits N.
 
-    Under AVX-512: prefer __m512 (16 floats) when N%16==0.
-    Fallback to __m256 (N%8==0) or __m128 (N%4==0).
+    Under AVX-512: prefer __m512d (8 doubles) when N%8==0.
+    Fallback to __m256d (N%4==0) or __m128d (N%2==0).
     """
-    if n % 16 == 0:
-        return "avx512", 16
     if n % 8 == 0:
-        return "avx2_256", 8
+        return "avx512", 8
     if n % 4 == 0:
-        return "avx2_128", 4
+        return "avx2_256", 4
+    if n % 2 == 0:
+        return "avx2_128", 2
     return "scalar", 1
 
 
@@ -42,32 +51,38 @@ def _simd_names(isa: str) -> dict:
     """Return intrinsic name fragments for the given ISA tag."""
     if isa == "avx512":
         return dict(
-            type="__m512",
-            load="_mm512_loadu_ps",
-            store="_mm512_storeu_ps",
-            fma="_mm512_fmadd_ps",
-            bcast=lambda ptr: f"_mm512_set1_ps(*({ptr}))",
-            lanes=16,
+            type="__m512d",
+            load="_mm512_loadu_pd",
+            store="_mm512_storeu_pd",
+            fma="_mm512_fmadd_pd",
+            bcast=lambda ptr: f"_mm512_set1_pd(*({ptr}))",
+            lanes=8,
             total_regs=32,
         )
     if isa == "avx2_256":
         return dict(
-            type="__m256",
-            load="_mm256_loadu_ps",
-            store="_mm256_storeu_ps",
-            fma="_mm256_fmadd_ps",
-            bcast=lambda ptr: f"_mm256_broadcast_ss({ptr})",
-            lanes=8,
+            type="__m256d",
+            load="_mm256_loadu_pd",
+            store="_mm256_storeu_pd",
+            fma="_mm256_fmadd_pd",
+            bcast=lambda ptr: f"_mm256_broadcast_sd({ptr})",
+            lanes=4,
             total_regs=16,
         )
     if isa == "avx2_128":
         return dict(
-            type="__m128",
-            load="_mm_loadu_ps",
-            store="_mm_storeu_ps",
-            fma="_mm_fmadd_ps",
-            bcast=lambda ptr: f"_mm_broadcast_ss({ptr})",
-            lanes=4,
+            type="__m128d",
+            load="_mm_loadu_pd",
+            store="_mm_storeu_pd",
+            fma="_mm_fmadd_pd",
+            # No _mm_broadcast_sd intrinsic exists (AVX's broadcast-from-
+            # memory set is _mm256_broadcast_sd/_mm256_broadcast_ss/
+            # _mm_broadcast_ss only) -- _mm_loaddup_pd (SSE3, available
+            # under immintrin.h whenever AVX2 is enabled) loads one double
+            # from memory and duplicates it into both __m128d lanes, the
+            # same "load from ptr, broadcast" semantics.
+            bcast=lambda ptr: f"_mm_loaddup_pd({ptr})",
+            lanes=2,
             total_regs=16,
         )
     return {}  # scalar — no specialization emitted
@@ -78,7 +93,7 @@ def _simd_names(isa: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def _gen_kernel(M: int, K: int, N: int, s: dict) -> list[str]:
-    """Generate named-register gemm_fixed<M,K,N,float> for one ISA."""
+    """Generate named-register gemm_fixed<M,K,N,double> for one ISA."""
     lanes = s["lanes"]
     total_regs = s["total_regs"]
     NV = N // lanes          # number of SIMD vectors covering N
@@ -89,17 +104,17 @@ def _gen_kernel(M: int, K: int, N: int, s: dict) -> list[str]:
 
     ty = s["type"]
     comment = (
-        f"// gemm_fixed<{M},{K},{N},float>  {ty}: "
+        f"// gemm_fixed<{M},{K},{N},double>  {ty}: "
         f"{M} rows × {NV} regs = {M*NV} accumulators; "
         f"B {NV} regs; A hoisted batch={batch} ({M*NV}+{NV}+{batch}≤{total_regs})"
     )
     lines = [
         comment,
         "template <>",
-        f"inline void gemm_fixed<{M}, {K}, {N}, float>(",
-        "        const float* __restrict__ A, int lda,",
-        "        const float* __restrict__ B, int ldb,",
-        "        float*       __restrict__ C, int ldc) {",
+        f"inline void gemm_fixed<{M}, {K}, {N}, double>(",
+        "        const double* __restrict__ A, int lda,",
+        "        const double* __restrict__ B, int ldb,",
+        "        double*       __restrict__ C, int ldc) {",
     ]
 
     # Load accumulators: c{row}_{vec}
@@ -152,15 +167,10 @@ def _gen_kernel(M: int, K: int, N: int, s: dict) -> list[str]:
 
 def _emit_shape(M: int, K: int, N: int) -> list[str]:
     """Emit ISA-guarded specialization blocks for one (M, K, N) shape."""
-    # AVX-512 block: widest ISA that fits N
-    isa512, lanes512 = "avx512", 16
-    isa256, lanes256 = "avx2_256", 8
-    isa128, lanes128 = "avx2_128", 4
-
     lines = []
 
     # Under __AVX512F__ — use widest available
-    if N % 16 == 0:
+    if N % 8 == 0:
         avx512_s = _simd_names("avx512")
         avx2_s   = _simd_names("avx2_256")
         lines += ["#if defined(__AVX512F__)"]
@@ -168,18 +178,18 @@ def _emit_shape(M: int, K: int, N: int) -> list[str]:
         lines += ["#elif defined(__AVX2__) && defined(__FMA__)"]
         lines += _gen_kernel(M, K, N, avx2_s)
         lines += ["#endif"]
-    elif N % 8 == 0:
+    elif N % 4 == 0:
         avx2_s = _simd_names("avx2_256")
         lines += ["#if defined(__AVX2__) && defined(__FMA__)"]
         lines += _gen_kernel(M, K, N, avx2_s)
         lines += ["#endif"]
-    elif N % 4 == 0:
+    elif N % 2 == 0:
         avx2_s = _simd_names("avx2_128")
         lines += ["#if defined(__AVX2__) && defined(__FMA__)"]
         lines += _gen_kernel(M, K, N, avx2_s)
         lines += ["#endif"]
     else:
-        lines += [f"// shape ({M},{K},{N}): N not divisible by 4 — no SIMD specialization"]
+        lines += [f"// shape ({M},{K},{N}): N not divisible by 2 — no SIMD specialization"]
 
     return lines
 
@@ -229,7 +239,7 @@ def main():
         for M, K, N in shapes:
             isa, lanes = _isa_for_n(N)
             if isa == "scalar":
-                print(f"  {M}x{K}x{N:>2}         scalar    —    —     — (N not divisible by 4)")
+                print(f"  {M}x{K}x{N:>2}         scalar    —    —     — (N not divisible by 2)")
                 continue
             s = _simd_names(isa)
             NV = N // s["lanes"]
