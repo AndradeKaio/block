@@ -4,7 +4,9 @@
 #include "matrix_io.hpp"
 #include "pipeline.hpp"
 
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -28,12 +30,28 @@ struct Args {
   int runs = 5;
   bool specialized = false;
   int print_shapes = 0;
+  bool histogram = false;
+  std::string merge_strategy = "sequential";
 };
 
 void print_usage(const char *prog) {
   std::fprintf(stderr,
                "Usage: %s <A.bsp> <B.bsp> [--runs N] [--validate FILE] "
-               "[--specialized-kernels] [--print-shapes N]\n",
+               "[--specialized-kernels] [--print-shapes N] [--histogram] "
+               "[--merge-strategy sequential|panels]\n"
+               "  --merge-strategy  Which merge_overlapping_output_blocks "
+               "implementation the timed\n"
+               "                    per-run symbolic phase uses (identical "
+               "grouping either way):\n"
+               "    sequential  (default) single global sweep-line + "
+               "union-find pass.\n"
+               "    panels      Row-panel output_blocks first (an output "
+               "block's row range is\n"
+               "                always its A-block's row range, so "
+               "row-disjoint panels can never\n"
+               "                share a group), then run one independent "
+               "sweep per panel in\n"
+               "                parallel via OpenMP.\n",
                prog);
 }
 
@@ -62,7 +80,15 @@ Args parse_args(int argc, char **argv) {
       args.specialized = true;
     else if (arg == "--print-shapes")
       args.print_shapes = std::atoi(next());
-    else if (arg == "--help" || arg == "-h") {
+    else if (arg == "--histogram")
+      args.histogram = true;
+    else if (arg == "--merge-strategy") {
+      args.merge_strategy = next();
+      if (args.merge_strategy != "sequential" && args.merge_strategy != "panels") {
+        std::fprintf(stderr, "--merge-strategy must be sequential|panels\n");
+        std::exit(1);
+      }
+    } else if (arg == "--help" || arg == "-h") {
       print_usage(argv[0]);
       std::exit(0);
     } else {
@@ -120,7 +146,7 @@ int main(int argc, char **argv) {
     std::printf("\nJSON_BEGIN\n{\n");
     std::printf("  \"kernel\": \"prisma_cpu\",\n");
     std::printf("  \"n_pairs\": 0, \"n_groups\": 0,\n");
-    std::printf("  \"pipe_total_ms\": 0.0,\n");
+    std::printf("  \"symbolic_ms\": [],\n");
     std::printf("  \"compute_ms\": []\n");
     std::printf("}\nJSON_END\n");
     return 0;
@@ -136,7 +162,7 @@ int main(int argc, char **argv) {
     std::printf("\nJSON_BEGIN\n{\n");
     std::printf("  \"kernel\": \"prisma_cpu\",\n");
     std::printf("  \"n_pairs\": 0, \"n_groups\": 0,\n");
-    std::printf("  \"pipe_total_ms\": 0.0,\n");
+    std::printf("  \"symbolic_ms\": [],\n");
     std::printf("  \"compute_ms\": []\n");
     std::printf("}\nJSON_END\n");
     return 0;
@@ -157,18 +183,21 @@ int main(int argc, char **argv) {
   std::printf("pairs=%zu  groups=%zu\n", found.contributions.size(),
               fused.fused_blocks.size());
 
-  benchmark_core::cpu_gemm_histogram(fused, A, B);
+  if (args.histogram)
+    benchmark_core::cpu_gemm_histogram(fused, A, B);
 
   if (args.print_shapes > 0) {
     t0 = Clock::now();
-    auto shapes = benchmark_core::cpu_gemm_top_shapes(fused, A, B, args.print_shapes);
+    auto shapes =
+        benchmark_core::cpu_gemm_top_shapes(fused, A, B, args.print_shapes);
     float pipe_topshapes_ms = ms_since(t0);
     float pipe_shapes_total_ms = pipe_total_ms + pipe_topshapes_ms;
     std::printf("\nJSON_BEGIN\n{\n");
     std::printf("  \"top_shapes\": [");
     for (int i = 0; i < (int)shapes.size(); ++i) {
       auto [m, k, n] = shapes[i];
-      if (i) std::printf(", ");
+      if (i)
+        std::printf(", ");
       std::printf("[%d, %d, %d]", m, k, n);
     }
     std::printf("],\n");
@@ -180,6 +209,7 @@ int main(int argc, char **argv) {
   }
 
   std::printf("kernel: %s\n", args.specialized ? "specialized" : "generic");
+  std::printf("merge-strategy: %s\n", args.merge_strategy.c_str());
 
   // Every timed run redoes the full symbolic pipeline (intersect -> merge ->
   // fuse -> plan_build) from scratch instead of reusing the `fused`/`plan`
@@ -192,14 +222,37 @@ int main(int argc, char **argv) {
   symbolic_ms_arr.reserve(args.runs + 1);
   compute_ms_arr.reserve(args.runs + 1);
 
+  // Temporary sub-stage breakdown to find which part of the symbolic phase
+  // is responsible for prisma's run-to-run variance (TACO's numbers are
+  // near-noiseless by comparison). Not exposed in the JSON output.
+  std::vector<double> intersect_ms_arr, merge_ms_arr, fuse_ms_arr,
+      planbuild_ms_arr;
+  intersect_ms_arr.reserve(args.runs + 1);
+  merge_ms_arr.reserve(args.runs + 1);
+  fuse_ms_arr.reserve(args.runs + 1);
+  planbuild_ms_arr.reserve(args.runs + 1);
+
   for (int r = 0; r <= args.runs; ++r) {
     auto ts0 = Clock::now();
-    auto found_r  = benchmark_core::find_intersecting_pairs(A.blocks, B.blocks);
-    auto groups_r = benchmark_core::merge_overlapping_output_blocks(found_r.output_blocks);
-    auto fused_r  = benchmark_core::block_fusion(found_r.output_blocks,
-                                                  found_r.contributions, groups_r);
-    auto plan     = benchmark_core::cpu_plan_build(fused_r, A, B);
+    auto found_r = benchmark_core::find_intersecting_pairs(A.blocks, B.blocks);
+    auto ts1 = Clock::now();
+    auto groups_r = args.merge_strategy == "panels"
+        ? benchmark_core::merge_overlapping_output_blocks_panels(found_r.output_blocks)
+        : benchmark_core::merge_overlapping_output_blocks(found_r.output_blocks);
+    auto ts2 = Clock::now();
+    auto fused_r = benchmark_core::block_fusion(found_r.output_blocks,
+                                                found_r.contributions, groups_r);
+    auto ts3 = Clock::now();
+    auto plan = benchmark_core::cpu_plan_build(fused_r, A, B);
     symbolic_ms_arr.push_back(double(ms_since(ts0)));
+    intersect_ms_arr.push_back(
+        std::chrono::duration<double, std::milli>(ts1 - ts0).count());
+    merge_ms_arr.push_back(
+        std::chrono::duration<double, std::milli>(ts2 - ts1).count());
+    fuse_ms_arr.push_back(
+        std::chrono::duration<double, std::milli>(ts3 - ts2).count());
+    planbuild_ms_arr.push_back(
+        std::chrono::duration<double, std::milli>(Clock::now() - ts3).count());
 
     double ms = args.specialized
                     ? benchmark_core::cpu_compute<Scalar, true>(plan)
@@ -221,7 +274,8 @@ int main(int argc, char **argv) {
       std::sort(entries.begin(), entries.end());
       FILE *vf = std::fopen(args.validate.c_str(), "w");
       if (!vf) {
-        std::fprintf(stderr, "prisma_cpu_bench: cannot open validate file: %s\n",
+        std::fprintf(stderr,
+                     "prisma_cpu_bench: cannot open validate file: %s\n",
                      args.validate.c_str());
       } else {
         for (const auto &[rr, cc, v] : entries)
@@ -233,10 +287,12 @@ int main(int argc, char **argv) {
     }
   }
 
-  std::printf("runs=%d  last: symbolic=%.3fms compute=%.3fms\n", args.runs,
-              symbolic_ms_arr.back(), compute_ms_arr.back());
+  std::printf("runs=%d  last: symbolic=%.3fms compute=%.3fms  n_groups=%zu\n",
+              args.runs, symbolic_ms_arr.back(), compute_ms_arr.back(),
+              fused.fused_blocks.size());
 
-  // Timing breakdown — mean of the N real timed-run measurements.
+  // Timing breakdown — mean of the N real timed-run measurements (index 0
+  // is the untimed warmup run, dropped like everywhere else in this file).
   auto avg = [](const std::vector<double> &v) {
     if (v.size() <= 1)
       return v.empty() ? 0.0 : v[0];
@@ -245,21 +301,52 @@ int main(int argc, char **argv) {
       s += v[i];
     return s / double(v.size() - 1);
   };
-  double avg_sym  = avg(symbolic_ms_arr);
+  auto stats = [&](const std::vector<double> &v) {
+    double mean = avg(v);
+    double mn = 1e300, mx = -1e300, ss = 0.0;
+    int n = 0;
+    for (int i = 1; i < (int)v.size(); ++i) {
+      mn = std::min(mn, v[i]);
+      mx = std::max(mx, v[i]);
+      ss += (v[i] - mean) * (v[i] - mean);
+      ++n;
+    }
+    double stddev = n > 1 ? std::sqrt(ss / n) : 0.0;
+    return std::array<double, 4>{mean, stddev, mn, mx};
+  };
+  double avg_sym = avg(symbolic_ms_arr);
   double avg_comp = avg(compute_ms_arr);
 
   std::printf("\n── symbolic breakdown ───────────────────────────────────\n");
-  std::printf("  symbolic per-run (avg of %d timed runs, redone cold every run)\n",
-              args.runs);
+  std::printf(
+      "  symbolic per-run (avg of %d timed runs, redone cold every run)\n",
+      args.runs);
   std::printf("    symbolic total   : %8.3f ms\n", avg_sym);
   std::printf("  compute per-run (avg of %d timed runs)\n", args.runs);
   std::printf("    compute total    : %8.3f ms\n", avg_comp);
+  std::printf("────────────────────────────────────────────────────────\n");
+
+  std::printf(
+      "\n── symbolic sub-stage variance (mean / stddev / min / max, ms) ──\n");
+  auto print_stage = [&](const char *name, const std::vector<double> &v) {
+    auto s = stats(v);
+    double cv = s[0] > 0 ? 100.0 * s[1] / s[0] : 0.0;
+    std::printf("  %-12s: %8.3f / %7.3f / %8.3f / %8.3f  (cv=%.1f%%)\n", name,
+                s[0], s[1], s[2], s[3], cv);
+  };
+  print_stage("intersect", intersect_ms_arr);
+  print_stage("merge", merge_ms_arr);
+  print_stage("fuse", fuse_ms_arr);
+  print_stage("plan_build", planbuild_ms_arr);
+  print_stage("symbolic_tot", symbolic_ms_arr);
+  print_stage("compute", compute_ms_arr);
   std::printf("────────────────────────────────────────────────────────\n");
 
   std::printf("\nJSON_BEGIN\n{\n");
   std::printf("  \"kernel\": \"prisma_cpu\",\n");
   std::printf("  \"n_pairs\": %zu, \"n_groups\": %zu,\n",
               found.contributions.size(), fused.fused_blocks.size());
+  std::printf("  \"merge_strategy\": \"%s\",\n", args.merge_strategy.c_str());
   std::printf("  \"symbolic_ms\": ");
   print_arr(symbolic_ms_arr);
   std::printf(",\n");

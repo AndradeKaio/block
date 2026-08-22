@@ -37,6 +37,14 @@ public:
     // [begin, end).
     std::vector<IntervalEntry> query(int begin, int end) const;
 
+    // Same, but appends into a caller-owned buffer instead of allocating a
+    // fresh vector per call. Does NOT clear `out` first -- callers doing one
+    // query per call should `out.clear()` themselves before calling. Meant
+    // for hot loops (e.g. a sweep) that would otherwise pay one heap
+    // allocation per query; the caller keeps `out`'s capacity alive across
+    // calls instead.
+    void query(int begin, int end, std::vector<IntervalEntry>& out) const;
+
 private:
     struct Node {
         int begin;
@@ -53,10 +61,20 @@ private:
 
     Node* root_ = nullptr;
 
+    // Free list of erased nodes, threaded through `left`, reused by the next
+    // insert instead of round-tripping through new/delete. A sweep that
+    // interleaves insert/remove (e.g. merge_overlapping_output_blocks) ends
+    // up doing about "peak active-set size" real allocations total instead
+    // of one per insert -- everything past that is a pool hit.
+    Node* free_list_ = nullptr;
+
+    Node* alloc_node(int begin, int end, int data, unsigned long long priority);
+    void free_node(Node* node);
+
     static void update(Node* node);
     static Node* merge(Node* a, Node* b);
     static void split(Node* node, int begin, int end, int data, Node*& left, Node*& right);
-    static Node* erase(Node* node, int begin, int end, int data, bool& removed);
+    Node* erase(Node* node, int begin, int end, int data, bool& removed);
     static void collect(const Node* node, int begin, int end, std::vector<IntervalEntry>& out);
     static void destroy(Node* node);
 };

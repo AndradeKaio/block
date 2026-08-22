@@ -22,17 +22,33 @@ bool triple_less(int b1, int e1, int d1, int b2, int e2, int d2) {
 IntervalTree::~IntervalTree() {
     destroy(root_);
     root_ = nullptr;
+    // Free-list nodes are real heap objects too (just detached from the
+    // tree), so they need the same cleanup.
+    while (free_list_) {
+        Node* next = free_list_->left;
+        delete free_list_;
+        free_list_ = next;
+    }
 }
 
-IntervalTree::IntervalTree(IntervalTree&& other) noexcept : root_(other.root_) {
+IntervalTree::IntervalTree(IntervalTree&& other) noexcept
+    : root_(other.root_), free_list_(other.free_list_) {
     other.root_ = nullptr;
+    other.free_list_ = nullptr;
 }
 
 IntervalTree& IntervalTree::operator=(IntervalTree&& other) noexcept {
     if (this != &other) {
         destroy(root_);
+        while (free_list_) {
+            Node* next = free_list_->left;
+            delete free_list_;
+            free_list_ = next;
+        }
         root_ = other.root_;
+        free_list_ = other.free_list_;
         other.root_ = nullptr;
+        other.free_list_ = nullptr;
     }
     return *this;
 }
@@ -83,8 +99,30 @@ void IntervalTree::split(Node* node, int begin, int end, int data, Node*& left, 
     }
 }
 
+IntervalTree::Node* IntervalTree::alloc_node(int begin, int end, int data,
+                                              unsigned long long priority) {
+    if (free_list_) {
+        Node* node = free_list_;
+        free_list_ = free_list_->left;
+        node->begin = begin;
+        node->end = end;
+        node->data = data;
+        node->max_end = end;
+        node->priority = priority;
+        node->left = nullptr;
+        node->right = nullptr;
+        return node;
+    }
+    return new Node(begin, end, data, priority);
+}
+
+void IntervalTree::free_node(Node* node) {
+    node->left = free_list_;
+    free_list_ = node;
+}
+
 void IntervalTree::insert(int begin, int end, int data) {
-    Node* node = new Node(begin, end, data, next_priority());
+    Node* node = alloc_node(begin, end, data, next_priority());
     Node* left = nullptr;
     Node* right = nullptr;
     split(root_, begin, end, data, left, right);
@@ -98,7 +136,7 @@ IntervalTree::Node* IntervalTree::erase(Node* node, int begin, int end, int data
     if (node->begin == begin && node->end == end && node->data == data) {
         removed = true;
         Node* merged = merge(node->left, node->right);
-        delete node;
+        free_node(node);
         return merged;
     }
     if (triple_less(begin, end, data, node->begin, node->end, node->data)) {
@@ -135,6 +173,10 @@ std::vector<IntervalEntry> IntervalTree::query(int begin, int end) const {
     std::vector<IntervalEntry> out;
     collect(root_, begin, end, out);
     return out;
+}
+
+void IntervalTree::query(int begin, int end, std::vector<IntervalEntry>& out) const {
+    collect(root_, begin, end, out);
 }
 
 void IntervalTree::destroy(Node* node) {

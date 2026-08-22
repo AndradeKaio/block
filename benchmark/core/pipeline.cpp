@@ -123,10 +123,14 @@ merge_overlapping_output_blocks(const std::vector<Block> &output_blocks) {
   });
 
   IntervalTree active;
+  std::vector<IntervalEntry> hits; // reused across the sweep -- avoids one
+                                    // heap allocation per kStart event
   for (const auto &e : events) {
     const Block &b = output_blocks[e.idx];
     if (e.kind == kStart) {
-      for (const auto &hit : active.query(b.c_start(), b.c_end() + 1))
+      hits.clear();
+      active.query(b.c_start(), b.c_end() + 1, hits);
+      for (const auto &hit : hits)
         unite(e.idx, hit.data);
       active.insert(b.c_start(), b.c_end() + 1, e.idx);
     } else {
@@ -144,6 +148,122 @@ merge_overlapping_output_blocks(const std::vector<Block> &output_blocks) {
       groups.push_back(Group{root, {i}});
     } else {
       groups[it->second].members.push_back(i);
+    }
+  }
+  return groups;
+}
+
+std::vector<Group>
+merge_overlapping_output_blocks_panels(const std::vector<Block> &output_blocks) {
+  const int n = static_cast<int>(output_blocks.size());
+
+  // Row-panel output_blocks directly (their row range IS their contributing
+  // A-block's row range, see intersect() in block.cpp) -- same sweep as
+  // prisma_cpu_spmm_bench.cpp's row_groups: sort by start row, merge while a
+  // block's start row falls inside the current panel's row extent.
+  std::vector<int> order(n);
+  std::iota(order.begin(), order.end(), 0);
+  std::sort(order.begin(), order.end(), [&](int x, int y) {
+    return output_blocks[x].r_start() < output_blocks[y].r_start();
+  });
+
+  std::vector<std::vector<int>> panels; // panels[p] = global output_blocks indices
+  int row_end = -1;
+  for (int i : order) {
+    const Block &b = output_blocks[i];
+    if (b.r_start() >= row_end) {
+      panels.push_back({});
+      row_end = b.r_end() + 1;
+    } else {
+      row_end = std::max(row_end, b.r_end() + 1);
+    }
+    panels.back().push_back(i);
+  }
+
+  const int np = static_cast<int>(panels.size());
+  std::vector<std::vector<Group>> per_panel(np);
+
+  // Panels are row-disjoint by construction, so their sweeps touch entirely
+  // separate IntervalTree/union-find state -- safe to run fully in parallel.
+#pragma omp parallel for schedule(dynamic, 1)
+  for (int p = 0; p < np; ++p) {
+    const std::vector<int> &idxs = panels[p];
+    const int m = static_cast<int>(idxs.size());
+
+    std::vector<int> parent(m);
+    std::iota(parent.begin(), parent.end(), 0);
+    auto find = [&](int x) {
+      while (parent[x] != x) {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+      }
+      return x;
+    };
+    auto unite = [&](int x, int y) {
+      const int rx = find(x);
+      const int ry = find(y);
+      if (rx != ry)
+        parent[rx] = ry;
+    };
+
+    enum EventKind { kEnd = 0, kStart = 1 };
+    struct Event {
+      int pos;
+      EventKind kind;
+      int local_idx;
+    };
+    std::vector<Event> events;
+    events.reserve(m * 2);
+    for (int li = 0; li < m; ++li) {
+      const Block &b = output_blocks[idxs[li]];
+      events.push_back({b.r_start(), kStart, li});
+      events.push_back({b.r_end() + 1, kEnd, li});
+    }
+    std::sort(events.begin(), events.end(), [](const Event &x, const Event &y) {
+      if (x.pos != y.pos)
+        return x.pos < y.pos;
+      return x.kind < y.kind;
+    });
+
+    IntervalTree active;
+    std::vector<IntervalEntry> hits;
+    for (const auto &e : events) {
+      const Block &b = output_blocks[idxs[e.local_idx]];
+      if (e.kind == kStart) {
+        hits.clear();
+        active.query(b.c_start(), b.c_end() + 1, hits);
+        for (const auto &hit : hits)
+          unite(e.local_idx, hit.data);
+        active.insert(b.c_start(), b.c_end() + 1, e.local_idx);
+      } else {
+        active.remove(b.c_start(), b.c_end() + 1, e.local_idx);
+      }
+    }
+
+    std::vector<Group> &out = per_panel[p];
+    std::unordered_map<int, std::size_t> group_index;
+    for (int li = 0; li < m; ++li) {
+      const int root = find(li);
+      auto it = group_index.find(root);
+      if (it == group_index.end()) {
+        group_index.emplace(root, out.size());
+        out.push_back(Group{root, {idxs[li]}}); // idxs[li]: back to global index
+      } else {
+        out[it->second].members.push_back(idxs[li]);
+      }
+    }
+  }
+
+  std::vector<Group> groups;
+  groups.reserve(n);
+  for (int p = 0; p < np; ++p) {
+    for (auto &g : per_panel[p]) {
+      // Local roots are only meaningful within their own panel's
+      // union-find; renumber to a globally unique id (nothing downstream
+      // depends on the specific value, only that members sharing a group
+      // share an id).
+      g.id = static_cast<int>(groups.size());
+      groups.push_back(std::move(g));
     }
   }
   return groups;
