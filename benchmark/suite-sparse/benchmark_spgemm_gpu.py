@@ -52,7 +52,7 @@ from pathlib import Path
 _SCRIPT_DIR = Path(__file__).parent
 _SPGEMM_GPU_DIR = _SCRIPT_DIR.parent / "SpGEMM" / "GPU"
 _CORE_DIR = _SCRIPT_DIR.parent / "core"
-_TMP_DIR = Path("/tmp/_prisma_spgemm_gpu/")
+_TMP_DIR = Path("/tmp/_prismac/spgemm/")
 
 sys.path.insert(0, str(_SCRIPT_DIR))
 from benchmark_spmm_cpu import (  # noqa: E402  (path must be set up first)
@@ -63,6 +63,7 @@ from benchmark_spmm_cpu import (  # noqa: E402  (path must be set up first)
     load_matrix_list,
     _parse_json_block,
 )
+from benchmark_spgemm_cpu import ensure_real_general  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # CSV schema
@@ -308,6 +309,7 @@ def benchmark_matrix(
     writer,
     f_csv,
     run_tc_block: bool,
+    mtx_cache: Path = Path("/tmp/mtx_cache"),
 ) -> None:
     name = row["name"]
     base = {
@@ -351,8 +353,18 @@ def benchmark_matrix(
     if tilespgemm_bin is not None:
         print(f"  [{'tilespgemm+cusparse':<28}] ", end="", flush=True)
         try:
+            # TileSpGEMM is external/third-party code with no symmetric- or
+            # pattern-format handling of its own (unlike bench_taco_gpu.cu and
+            # bench_tc_spgemm.cu, which both have their own is_pattern/
+            # is_symmetric expansion, see their read_mtx()) -- fed the raw
+            # suite-sparse .mtx directly, it fails on every symmetric/pattern
+            # matrix, which for typical SuiteSparse A×A test sets is most or
+            # all of them. Convert first, exactly like TACO CPU already does
+            # (benchmark_spgemm_cpu.py's ensure_real_general), instead of
+            # passing the raw file through unconverted.
+            tile_mtx = ensure_real_general(mtx, mtx_cache)
             tile_sym, tile_cmp, tile_tot, cs_sym, cs_cmp, cs_tot = \
-                run_tilespgemm_and_cusparse(tilespgemm_bin, mtx, mtx, device, runs, timeout)
+                run_tilespgemm_and_cusparse(tilespgemm_bin, tile_mtx, tile_mtx, device, runs, timeout)
             for run_id, (s, c, t) in enumerate(zip(tile_sym, tile_cmp, tile_tot)):
                 _emit(writer, f_csv, base, "tilespgemm", run_id, s, c, t)
             for run_id, (s, c, t) in enumerate(zip(cs_sym, cs_cmp, cs_tot)):
@@ -369,7 +381,13 @@ def benchmark_matrix(
     if taco_bin is not None:
         print(f"  [{'taco_gpu':<28}] ", end="", flush=True)
         try:
-            triples = run_taco_gpu(taco_bin, mtx, mtx, runs, timeout)
+            # bench_taco_gpu.cu's read_mtx() has no symmetric/pattern
+            # expansion (same limitation as SpGEMM CPU's bench_taco.c,
+            # which is why benchmark_spgemm_cpu.py already converts before
+            # calling it) -- convert here too instead of feeding it a raw
+            # symmetric/pattern matrix it can't parse correctly.
+            taco_mtx = ensure_real_general(mtx, mtx_cache)
+            triples = run_taco_gpu(taco_bin, taco_mtx, taco_mtx, runs, timeout)
             for run_id, (s, c, t) in enumerate(triples):
                 _emit(writer, f_csv, base, "taco_gpu", run_id, s, c, t)
             timed = [t for _, _, t in triples[1:]] or [t for _, _, t in triples]
@@ -381,7 +399,9 @@ def benchmark_matrix(
     if tc_spgemm_bin is not None:
         print(f"  [{'tc_spgemm':<28}] ", end="", flush=True)
         try:
-            triples = run_tc_spgemm(tc_spgemm_bin, mtx, mtx, runs, timeout)
+            # Same reader limitation as bench_taco_gpu.cu -- see comment above.
+            tc_mtx = ensure_real_general(mtx, mtx_cache)
+            triples = run_tc_spgemm(tc_spgemm_bin, tc_mtx, tc_mtx, runs, timeout)
             for run_id, (s, c, t) in enumerate(triples):
                 _emit(writer, f_csv, base, "tc_spgemm", run_id, s, c, t)
             timed = [t for _, _, t in triples[1:]] or [t for _, _, t in triples]

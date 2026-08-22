@@ -56,6 +56,7 @@ _SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(_SCRIPT_DIR))
 
 from benchmark_spgemm_cpu import (  # noqa: E402
+    _TMP_DIR,
     compile_prisma_spgemm,
     compile_prisma_spgemm_per_matrix,
     compile_taco_cpu,
@@ -142,6 +143,23 @@ def _compare(C: np.ndarray, C_ref: np.ndarray,
     )
 
 
+def _top_failures(C: np.ndarray, C_ref: np.ndarray, rtol: float, atol: float,
+                  limit: int = 5) -> list[tuple[int, int, float, float]]:
+    """Return up to `limit` (row, col, got, ref) tuples for the worst-by-
+    absolute-diff failing cells -- lets a FAIL be traced to specific output
+    coordinates instead of only a count, e.g. to cross-reference against
+    prisma_bench.cu's --dump-plan output and find which compute region
+    produced a given wrong cell."""
+    diff  = np.abs(C - C_ref)
+    scale = atol + rtol * np.abs(C_ref)
+    rows, cols = np.nonzero(diff > scale)
+    if rows.size == 0:
+        return []
+    order = np.argsort(-diff[rows, cols])[:limit]
+    return [(int(rows[i]), int(cols[i]), float(C[rows[i], cols[i]]),
+             float(C_ref[rows[i], cols[i]])) for i in order]
+
+
 # ---------------------------------------------------------------------------
 # Core validation logic
 # ---------------------------------------------------------------------------
@@ -152,6 +170,7 @@ def validate_matrix(
     taco_bin: Path | None, taco_opt_bin: Path | None, prisma_bin: Path | None,
     active: list, top_n: int, blas: bool, rtol: float, atol: float,
     timeout: int, tmp: Path, work_dir: Path, mtx_cache: Path,
+    merge_strategy: str = "sequential",
 ) -> bool:
     name = row["name"]
     bsp  = mtx.with_suffix(".bsp")
@@ -241,7 +260,8 @@ def validate_matrix(
                 label = "prisma_generic"
                 print(f"  [{label:<22}] ", end="", flush=True)
                 vf = tmp / f"{name}_C_{label}.coo"
-                cmd = [str(prisma_bin), str(bsp), str(bsp), "--runs", "1", "--validate", str(vf)]
+                cmd = [str(prisma_bin), str(bsp), str(bsp), "--runs", "1", "--validate", str(vf),
+                       "--merge-strategy", merge_strategy]
                 try:
                     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
                 except subprocess.TimeoutExpired:
@@ -283,7 +303,8 @@ def validate_matrix(
                         )
                         vf = tmp / f"{name}_C_{label}.coo"
                         cmd = [str(top10_bin), str(bsp), str(bsp), "--runs", "1",
-                               "--specialized-kernels", "--validate", str(vf)]
+                               "--specialized-kernels", "--validate", str(vf),
+                               "--merge-strategy", merge_strategy]
                         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
                         if r.returncode != 0:
                             print(f"FAILED (exit {r.returncode})")
@@ -346,7 +367,7 @@ def parse_args():
     p.add_argument("csv", metavar="MATRICES.csv", nargs="?", default=None,
                    help="input CSV with at least a 'name' column")
     p.add_argument("--bin-dir", default="", dest="bin_dir",
-                   help="directory for compiled binaries (default: temp dir)")
+                   help=f"directory for compiled binaries (default: {_TMP_DIR})")
     p.add_argument("--no-compile", action="store_true",
                    help="skip compilation; binaries must already exist in --bin-dir")
     p.add_argument("--prisma-bin", default="", dest="prisma_bin",
@@ -372,13 +393,20 @@ def parse_args():
                    help="absolute tolerance (default 1e-6, see --rtol)")
     p.add_argument("--timeout", type=int, default=300,
                    help="per-contender timeout in seconds (default 300)")
+    p.add_argument("--merge-strategy", default="sequential", dest="merge_strategy",
+                   choices=["sequential", "panels"],
+                   help="prisma_cpu_bench's merge_overlapping_output_blocks "
+                        "implementation to validate: 'sequential' (default, "
+                        "single global sweep) or 'panels' (row-panel decomposition, "
+                        "parallel via OpenMP -- see core/pipeline.hpp, provably same "
+                        "grouping as 'sequential')")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
-    bin_dir = Path(args.bin_dir) if args.bin_dir else Path(tempfile.mkdtemp(prefix="validate_spgemm_cpu_bin_"))
+    bin_dir = Path(args.bin_dir) if args.bin_dir else _TMP_DIR
     bin_dir.mkdir(parents=True, exist_ok=True)
 
     active = [l for l in _ALL_LABELS if l in args.kernels.split(",")] if args.kernels else list(_ALL_LABELS)
@@ -437,6 +465,7 @@ def main() -> None:
     print(f"Matrices : {len(matrices)}")
     print(f"Kernels  : {active}")
     print(f"Tolerances: rtol={args.rtol}  atol={args.atol}")
+    print(f"Merge strategy: {args.merge_strategy}")
     print()
 
     n_pass = n_fail = n_skip = 0
@@ -459,6 +488,7 @@ def main() -> None:
             ok = validate_matrix(
                 row, mtx, taco_bin, taco_opt_bin, prisma_bin, active, args.top_n, args.blas,
                 args.rtol, args.atol, args.timeout, tmp, bin_dir, mtx_cache,
+                merge_strategy=args.merge_strategy,
             )
             elapsed = time.time() - t0
             print(f"  ({elapsed:.1f}s)")

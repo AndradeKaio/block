@@ -5,8 +5,12 @@ suite-sparse/benchmark_spgemm_cpu.py — CPU SpGEMM benchmark on SuiteSparse mat
 Computes C = A × A (square self-product) and compares:
   taco_cpu       — TACO-generated SpGEMM kernel (unoptimized)
   taco_cpu_opt   — TACO-generated SpGEMM kernel (parallelized + reordered)
-  prisma_generic — Prisma, gemm_fallback (#pragma omp simd, auto-vectorised)
-  prisma_top10   — Prisma, per-matrix compiled with top-N (M,K,N) dispatch table
+  prisma_generic      — Prisma, gemm_fallback (#pragma omp simd, auto-vectorised)
+  prisma_top10        — Prisma, per-matrix compiled with top-N (M,K,N) dispatch table
+  prisma_top10_panels — same binary as prisma_top10, but with --merge-strategy panels:
+                        merge_overlapping_output_blocks_panels, a row-panel-parallel
+                        (OpenMP) implementation instead of the default single global
+                        sweep -- see core/pipeline.hpp; provably the same grouping
 
 The symbolic pipeline (TACO's assemble(); Prisma's intersect pairs → merge groups
 → block fusion → plan build) is redone from scratch on every timed run, not run
@@ -31,7 +35,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -40,10 +43,15 @@ from pathlib import Path
 # Paths
 # ---------------------------------------------------------------------------
 
-_SCRIPT_DIR         = Path(__file__).parent
-_CPU_DIR            = _SCRIPT_DIR.parent / "SpGEMM" / "CPU"
-_CORE_DIR           = _SCRIPT_DIR.parent / "core"
+_SCRIPT_DIR = Path(__file__).parent
+_CPU_DIR = _SCRIPT_DIR.parent / "SpGEMM" / "CPU"
+_CORE_DIR = _SCRIPT_DIR.parent / "core"
 _GEN_SPGEMM_KERNELS = _SCRIPT_DIR.parent / "SpGEMM" / "gen_spgemm_kernels.py"
+# Shared compile output dir for every SpGEMM kernel (CPU/GPU, benchmark/
+# validate) -- same /tmp/_prismac/ root SpMM uses, nested under spgemm/ so
+# the two don't collide, and reused across runs instead of a fresh mkdtemp
+# each time so repeated invocations don't need to recompile from scratch.
+_TMP_DIR = Path("/tmp/_prismac/spgemm/")
 
 # ---------------------------------------------------------------------------
 # CSV schema
@@ -153,7 +161,7 @@ def _parse_json_block(stdout: str) -> dict:
         return {}
 
 
-_TACO_ASM_RE  = re.compile(r"run_(\d+)_assemble_ns=(\d+)")
+_TACO_ASM_RE = re.compile(r"run_(\d+)_assemble_ns=(\d+)")
 _TACO_COMP_RE = re.compile(r"run_(\d+)_compute_ns=(\d+)")
 
 
@@ -175,6 +183,7 @@ _CORE_SRCS = [
 
 def _find_hdf5() -> tuple[str, str]:
     import platform
+
     for candidate in [
         "/usr/include/hdf5/serial",
         "/usr/local/include",
@@ -188,9 +197,9 @@ def _find_hdf5() -> tuple[str, str]:
 
     machine = platform.machine()
     triplet = {
-        "x86_64":  "x86_64-linux-gnu",
+        "x86_64": "x86_64-linux-gnu",
         "aarch64": "aarch64-linux-gnu",
-        "arm":     "arm-linux-gnueabihf",
+        "arm": "arm-linux-gnueabihf",
     }.get(machine, machine + "-linux-gnu")
 
     for candidate in [
@@ -199,8 +208,9 @@ def _find_hdf5() -> tuple[str, str]:
         "/usr/local/lib",
         f"/usr/lib/{triplet}",
     ]:
-        if (Path(candidate) / "libhdf5.so").exists() or \
-           (Path(candidate) / "libhdf5.a").exists():
+        if (Path(candidate) / "libhdf5.so").exists() or (
+            Path(candidate) / "libhdf5.a"
+        ).exists():
             lib = candidate
             break
     else:
@@ -216,20 +226,26 @@ def compile_taco_cpu(kernel_h: str, out: Path, n_threads: int) -> Path:
     """Compile bench_taco.c against the given TACO kernel header."""
     src = str(_CPU_DIR / "bench_taco.c")
     cmd = [
-        "gcc", "-O3", "-march=native", f'-DTACO_KERNEL_H="{kernel_h}"',
+        "gcc",
+        "-O3",
+        "-march=native",
+        f'-DTACO_KERNEL_H="{kernel_h}"',
         f"-DNUM_THREADS={n_threads}",
         "-fopenmp",
         f"-I{_CPU_DIR}",
-        src, "-lm", "-o", str(out),
+        src,
+        "-lm",
+        "-o",
+        str(out),
     ]
     label = out.name
     print(f"  Compiling {label} … ", end="", flush=True)
     t0 = time.time()
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        print(f"FAILED ({time.time()-t0:.1f}s)\n{r.stderr[-2000:]}")
+        print(f"FAILED ({time.time() - t0:.1f}s)\n{r.stderr[-2000:]}")
         raise RuntimeError(f"{label} compilation failed")
-    print(f"ok ({time.time()-t0:.1f}s)")
+    print(f"ok ({time.time() - t0:.1f}s)")
     return out
 
 
@@ -238,12 +254,19 @@ def compile_prisma_spgemm(out: Path, blas: bool = False) -> Path:
     srcs = [str(_CORE_DIR / s) for s in _CORE_SRCS]
     srcs.append(str(_CPU_DIR / "prisma_cpu_bench.cpp"))
     cmd = [
-        "g++", "-O3", "-std=c++20", "-fopenmp", "-march=native",
+        "g++",
+        "-O3",
+        "-std=c++20",
+        "-fopenmp",
+        "-march=native",
         "-DHAVE_HDF5",
-        f"-I{_CORE_DIR}", f"-I{_CPU_DIR}", f"-I{_HDF5_INC}",
+        f"-I{_CORE_DIR}",
+        f"-I{_CPU_DIR}",
+        f"-I{_HDF5_INC}",
         *srcs,
         str(Path(_HDF5_LIB) / "libhdf5.so"),
-        "-o", str(out),
+        "-o",
+        str(out),
     ]
     if blas:
         cmd[-1:-1] = ["-DHAVE_BLAS", "-lblas"]
@@ -251,9 +274,9 @@ def compile_prisma_spgemm(out: Path, blas: bool = False) -> Path:
     t0 = time.time()
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        print(f"FAILED ({time.time()-t0:.1f}s)\n{r.stderr[-3000:]}")
+        print(f"FAILED ({time.time() - t0:.1f}s)\n{r.stderr[-3000:]}")
         raise RuntimeError("prisma_cpu_bench compilation failed")
-    print(f"ok ({time.time()-t0:.1f}s)")
+    print(f"ok ({time.time() - t0:.1f}s)")
     return out
 
 
@@ -297,7 +320,7 @@ def run_taco_cpu(
 
     result = []
     for run_id in range(runs + 1):
-        sym  = asm_ns.get(run_id, 0) / 1e6
+        sym = asm_ns.get(run_id, 0) / 1e6
         comp = comp_ns.get(run_id, 0) / 1e6
         result.append((sym, comp, sym + comp))
     return result
@@ -310,6 +333,7 @@ def run_prisma_spgemm(
     timeout: int,
     specialized: bool = False,
     extra_sym_ms: float = 0.0,
+    merge_strategy: str = "sequential",
 ) -> tuple[list[tuple[float, float, float]], int, int]:
     """Run prisma_cpu_bench with A=B=bsp (A×A) and return timing triples.
 
@@ -327,10 +351,15 @@ def run_prisma_spgemm(
     symbolic cost above, that setup truly happens once regardless of n_timed,
     so it alone is amortised (divided by n_timed) on top of each run's real
     symbolic measurement.
+
+    merge_strategy selects prisma_cpu_bench's merge_overlapping_output_blocks
+    implementation ("sequential" (default) or "panels", see core/pipeline.hpp)
+    -- both provably produce the same grouping, this only affects symbolic_ms.
     """
     if not bsp.exists():
         raise FileNotFoundError(f"BSP not found: {bsp}")
-    cmd = [str(binary), str(bsp), str(bsp), "--runs", str(runs)]
+    cmd = [str(binary), str(bsp), str(bsp), "--runs", str(runs),
+           "--merge-strategy", merge_strategy]
     if specialized:
         cmd.append("--specialized-kernels")
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -341,21 +370,23 @@ def run_prisma_spgemm(
     d = _parse_json_block(r.stdout)
     if not d:
         raise RuntimeError(f"prisma_cpu_bench: no JSON output:\n{r.stdout[-400:]}")
-    compute_ms  = d.get("compute_ms")
+    compute_ms = d.get("compute_ms")
     symbolic_ms = d.get("symbolic_ms")
     if not compute_ms or not symbolic_ms or len(compute_ms) != len(symbolic_ms):
         raise RuntimeError(
-            "prisma_cpu_bench: missing/mismatched symbolic_ms or compute_ms in JSON"
+            "prisma_cpu_bench: empty/mismatched compute_ms or symbolic_ms in JSON "
+            f"(n_pairs={d.get('n_pairs', '?')} -- 0 means the matrix genuinely "
+            f"has no intersecting blocks for A×A, not a parse bug): {d}"
         )
 
-    n_pairs         = int(d.get("n_pairs",  0))
-    n_groups        = int(d.get("n_groups", 0))
-    n_timed         = max(len(compute_ms) - 1, 1)
+    n_pairs = int(d.get("n_pairs", 0))
+    n_groups = int(d.get("n_groups", 0))
+    n_timed = max(len(compute_ms) - 1, 1)
     amortised_extra = extra_sym_ms / n_timed
 
     triples = []
     for s, c in zip(symbolic_ms, compute_ms):
-        sym  = float(s) + amortised_extra
+        sym = float(s) + amortised_extra
         comp = float(c)
         triples.append((sym, comp, sym + comp))
 
@@ -383,7 +414,9 @@ def analyze_spgemm_shapes(
         )
     d = _parse_json_block(r.stdout)
     if not d:
-        raise RuntimeError(f"prisma_cpu_bench: no JSON from --print-shapes:\n{r.stdout[-400:]}")
+        raise RuntimeError(
+            f"prisma_cpu_bench: no JSON from --print-shapes:\n{r.stdout[-400:]}"
+        )
     shapes = [tuple(s) for s in d.get("top_shapes", [])]
     pipe_total_ms = float(d.get("pipe_total_ms", 0.0))
     return shapes, pipe_total_ms
@@ -398,8 +431,14 @@ def gen_spgemm_kernels_files(
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     shapes_arg = ",".join(f"{m}x{k}x{n}" for m, k, n in shapes)
-    cmd = [sys.executable, str(_GEN_SPGEMM_KERNELS),
-           "--shapes", shapes_arg, "--out-dir", str(out_dir)]
+    cmd = [
+        sys.executable,
+        str(_GEN_SPGEMM_KERNELS),
+        "--shapes",
+        shapes_arg,
+        "--out-dir",
+        str(out_dir),
+    ]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(
@@ -412,24 +451,35 @@ def gen_spgemm_kernels_files(
 
 
 def compile_prisma_spgemm_per_matrix(
-    dispatch_hpp: Path, out: Path, blas: bool = False,
+    dispatch_hpp: Path,
+    out: Path,
+    blas: bool = False,
     kernels_hpp: Path | None = None,
 ) -> Path:
     """Compile prisma_cpu_bench with a per-matrix generated dispatch (and kernels) table."""
     srcs = [str(_CORE_DIR / s) for s in _CORE_SRCS]
     srcs.append(str(_CPU_DIR / "prisma_cpu_bench.cpp"))
     cmd = [
-        "g++", "-O3", "-std=c++20", "-fopenmp", "-march=native",
+        "g++",
+        "-O3",
+        "-std=c++20",
+        "-fopenmp",
+        "-march=native",
         "-DHAVE_HDF5",
         f'-DSPGEMM_DISPATCH_H="{dispatch_hpp.resolve()}"',
-        f"-I{_CORE_DIR}", f"-I{_CPU_DIR}", f"-I{_HDF5_INC}",
+        f"-I{_CORE_DIR}",
+        f"-I{_CPU_DIR}",
+        f"-I{_HDF5_INC}",
         *srcs,
         str(Path(_HDF5_LIB) / "libhdf5.so"),
-        "-o", str(out),
+        "-o",
+        str(out),
     ]
     if kernels_hpp is not None:
-        cmd.insert(cmd.index("-DHAVE_HDF5") + 1,
-                   f'-DSPGEMM_KERNELS_H="{kernels_hpp.resolve()}"')
+        cmd.insert(
+            cmd.index("-DHAVE_HDF5") + 1,
+            f'-DSPGEMM_KERNELS_H="{kernels_hpp.resolve()}"',
+        )
     if blas:
         cmd[-1:-1] = ["-DHAVE_BLAS", "-lblas"]
     label = out.name
@@ -437,9 +487,9 @@ def compile_prisma_spgemm_per_matrix(
     t0 = time.time()
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        print(f"FAILED ({time.time()-t0:.1f}s)\n{r.stderr[-3000:]}")
+        print(f"FAILED ({time.time() - t0:.1f}s)\n{r.stderr[-3000:]}")
         raise RuntimeError(f"{label} compilation failed")
-    print(f"ok ({time.time()-t0:.1f}s)")
+    print(f"ok ({time.time() - t0:.1f}s)")
     return out
 
 
@@ -448,19 +498,30 @@ def compile_prisma_spgemm_per_matrix(
 # ---------------------------------------------------------------------------
 
 
-def _emit(writer, f_csv, base: dict, kernel: str, run_id: int,
-          sym: float, comp: float, total: float,
-          n_pairs: int | str = "", n_groups: int | str = "") -> None:
-    writer.writerow({
-        **base,
-        "kernel":      kernel,
-        "run_id":      run_id,
-        "symbolic_ms": _fmt(sym),
-        "compute_ms":  _fmt(comp),
-        "total_ms":    _fmt(total),
-        "n_pairs":     n_pairs,
-        "n_groups":    n_groups,
-    })
+def _emit(
+    writer,
+    f_csv,
+    base: dict,
+    kernel: str,
+    run_id: int,
+    sym: float,
+    comp: float,
+    total: float,
+    n_pairs: int | str = "",
+    n_groups: int | str = "",
+) -> None:
+    writer.writerow(
+        {
+            **base,
+            "kernel": kernel,
+            "run_id": run_id,
+            "symbolic_ms": _fmt(sym),
+            "compute_ms": _fmt(comp),
+            "total_ms": _fmt(total),
+            "n_pairs": n_pairs,
+            "n_groups": n_groups,
+        }
+    )
     f_csv.flush()
 
 
@@ -476,6 +537,7 @@ def benchmark_matrix(
     f_csv,
     run_generic: bool = True,
     run_top10: bool = True,
+    run_top10_panels: bool = True,
     top_n: int = 10,
     blas: bool = False,
     work_dir: Path | None = None,
@@ -485,9 +547,9 @@ def benchmark_matrix(
     base = {
         "matrix_name": name,
         "group": row.get("group", ""),
-        "rows":  row.get("rows",  ""),
-        "cols":  row.get("cols",  ""),
-        "nnz":   row.get("nnz",   ""),
+        "rows": row.get("rows", ""),
+        "cols": row.get("cols", ""),
+        "nnz": row.get("nnz", ""),
     }
 
     # ── TACO (needs real-general MTX) ─────────────────────────────────────────
@@ -497,7 +559,7 @@ def benchmark_matrix(
         print(f"  [{label:<28}] ", end="", flush=True)
         try:
             taco_mtx = ensure_real_general(mtx, mtx_cache)
-            triples  = run_taco_cpu(binary, taco_mtx, runs, timeout)
+            triples = run_taco_cpu(binary, taco_mtx, runs, timeout)
         except (RuntimeError, subprocess.TimeoutExpired, Exception) as e:
             print(f"FAILED ({e})")
             for run_id in range(runs + 1):
@@ -506,7 +568,9 @@ def benchmark_matrix(
         for run_id, (s, c, t) in enumerate(triples):
             _emit(writer, f_csv, base, label, run_id, s, c, t)
         timed = [t for _, _, t in triples[1:]] or [t for _, _, t in triples]
-        print(f"avg {sum(timed)/len(timed):.3f} ms  ({len(triples)} runs incl. warmup)")
+        print(
+            f"avg {sum(timed) / len(timed):.3f} ms  ({len(triples)} runs incl. warmup)"
+        )
 
     # ── Prisma (needs .bsp) ───────────────────────────────────────────────────
     if prisma_bin is None:
@@ -517,12 +581,14 @@ def benchmark_matrix(
         print(f"  [prisma_*] BSP not found ({bsp.name}) — skipping Prisma variants")
         return
 
-    def _run_prisma(label: str, binary: Path, specialized: bool,
-                    extra_sym_ms: float = 0.0) -> None:
+    def _run_prisma(
+        label: str, binary: Path, specialized: bool, extra_sym_ms: float = 0.0,
+        merge_strategy: str = "sequential",
+    ) -> None:
         print(f"  [{label:<28}] ", end="", flush=True)
         try:
             triples, n_pairs, n_groups = run_prisma_spgemm(
-                binary, bsp, runs, timeout, specialized, extra_sym_ms
+                binary, bsp, runs, timeout, specialized, extra_sym_ms, merge_strategy
             )
         except (RuntimeError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             print(f"FAILED ({e})")
@@ -533,33 +599,58 @@ def benchmark_matrix(
             _emit(writer, f_csv, base, label, run_id, s, c, t, n_pairs, n_groups)
         timed = [t for _, _, t in triples[1:]] or [t for _, _, t in triples]
         sym_timed = [s for s, _, _ in triples[1:]] or [s for s, _, _ in triples]
-        print(f"avg {sum(timed)/len(timed):.3f} ms  "
-              f"(sym avg={sum(sym_timed)/len(sym_timed):.2f} ms, "
-              f"pairs={n_pairs}, groups={n_groups})")
+        print(
+            f"avg {sum(timed) / len(timed):.3f} ms  "
+            f"(sym avg={sum(sym_timed) / len(sym_timed):.2f} ms, "
+            f"pairs={n_pairs}, groups={n_groups})"
+        )
 
     if run_generic:
         _run_prisma("prisma_generic", prisma_bin, specialized=False)
 
     if run_top10:
         print(f"  [{'prisma_top10':<28}] ", end="", flush=True)
-        mat_work = (work_dir / name) if work_dir else Path(tempfile.mkdtemp(prefix=f"ss_spgemm_{name}_"))
+        mat_work = (work_dir / name) if work_dir else (_TMP_DIR / name)
         mat_work.mkdir(parents=True, exist_ok=True)
         try:
-            shapes, shapes_sym_ms = analyze_spgemm_shapes(prisma_bin, bsp, top_n, timeout)
+            shapes, shapes_sym_ms = analyze_spgemm_shapes(
+                prisma_bin, bsp, top_n, timeout
+            )
+            print(shapes, shapes_sym_ms)
             if not shapes:
                 print("SKIPPED (no shapes returned)")
             else:
                 kernels_hpp, dispatch_hpp = gen_spgemm_kernels_files(shapes, mat_work)
                 top10_bin = compile_prisma_spgemm_per_matrix(
-                    dispatch_hpp, mat_work / "prisma_cpu_bench_top10", blas,
+                    dispatch_hpp,
+                    mat_work / "prisma_cpu_bench_top10",
+                    blas,
                     kernels_hpp=kernels_hpp,
                 )
-                _run_prisma("prisma_top10", top10_bin,
-                            specialized=True, extra_sym_ms=shapes_sym_ms)
+                _run_prisma(
+                    "prisma_top10",
+                    top10_bin,
+                    specialized=True,
+                    extra_sym_ms=shapes_sym_ms,
+                    merge_strategy="sequential",
+                )
+                if run_top10_panels:
+                    # Same compiled binary, same shapes analysis -- only the
+                    # runtime --merge-strategy flag differs, so no need to
+                    # recompile or re-run analyze_spgemm_shapes.
+                    _run_prisma(
+                        "prisma_top10_panels",
+                        top10_bin,
+                        specialized=True,
+                        extra_sym_ms=shapes_sym_ms,
+                        merge_strategy="panels",
+                    )
         except (RuntimeError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             print(f"FAILED ({e})")
             for run_id in range(runs + 1):
                 _emit(writer, f_csv, base, "prisma_top10", run_id, _NAN, _NAN, _NAN)
+                if run_top10_panels:
+                    _emit(writer, f_csv, base, "prisma_top10_panels", run_id, _NAN, _NAN, _NAN)
 
 
 # ---------------------------------------------------------------------------
@@ -573,44 +664,107 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("csv", metavar="MATRICES.csv",
-                   help="input CSV with at least a 'name' column")
+    p.add_argument(
+        "csv", metavar="MATRICES.csv", help="input CSV with at least a 'name' column"
+    )
 
     g = p.add_argument_group("Run control")
-    g.add_argument("--runs", type=int, default=5,
-                   help="timed repetitions per matrix; run_id 0 = warmup (default: 5)")
-    g.add_argument("--timeout", type=int, default=300,
-                   help="per-matrix timeout in seconds (default: 300)")
-    g.add_argument("--threads", type=int, default=os.cpu_count() or 1,
-                   help="OMP_NUM_THREADS for all runs (default: nproc)")
+    g.add_argument(
+        "--runs",
+        type=int,
+        default=5,
+        help="timed repetitions per matrix; run_id 0 = warmup (default: 5)",
+    )
+    g.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        help="per-matrix timeout in seconds (default: 300)",
+    )
+    g.add_argument(
+        "--threads",
+        type=int,
+        default=os.cpu_count() or 1,
+        help="OMP_NUM_THREADS for all runs (default: nproc)",
+    )
 
     g = p.add_argument_group("Paths")
-    g.add_argument("--out", default="spgemm_cpu_results.csv",
-                   help="output CSV, append mode (default: spgemm_cpu_results.csv)")
-    g.add_argument("--work-dir", default="",
-                   help="directory for compiled binaries (default: temp dir)")
-    g.add_argument("--prisma-bin", default="", dest="prisma_bin",
-                   help="pre-built prisma_cpu_bench binary (skips compilation)")
-    g.add_argument("--taco-bin", default="", dest="taco_bin",
-                   help="pre-built bench_taco_cpu binary (skips compilation)")
-    g.add_argument("--taco-opt-bin", default="", dest="taco_opt_bin",
-                   help="pre-built bench_taco_cpu_opt binary (skips compilation)")
+    g.add_argument(
+        "--out",
+        default="spgemm_cpu_results.csv",
+        help="output CSV, append mode (default: spgemm_cpu_results.csv)",
+    )
+    g.add_argument(
+        "--work-dir",
+        default="",
+        help=f"directory for compiled binaries (default: {_TMP_DIR})",
+    )
+    g.add_argument(
+        "--prisma-bin",
+        default="",
+        dest="prisma_bin",
+        help="pre-built prisma_cpu_bench binary (skips compilation)",
+    )
+    g.add_argument(
+        "--taco-bin",
+        default="",
+        dest="taco_bin",
+        help="pre-built bench_taco_cpu binary (skips compilation)",
+    )
+    g.add_argument(
+        "--taco-opt-bin",
+        default="",
+        dest="taco_opt_bin",
+        help="pre-built bench_taco_cpu_opt binary (skips compilation)",
+    )
 
     g = p.add_argument_group("Build / skip")
-    g.add_argument("--no-compile", action="store_true",
-                   help="skip compilation; binaries must already exist in work-dir")
-    g.add_argument("--blas", action="store_true",
-                   help="link BLAS when compiling prisma (enables BLAS tile path)")
-    g.add_argument("--no-taco", action="store_true", dest="no_taco",
-                   help="skip both TACO kernels")
-    g.add_argument("--no-prisma", action="store_true", dest="no_prisma",
-                   help="skip all Prisma kernels")
-    g.add_argument("--no-generic", action="store_true", dest="no_generic",
-                   help="skip prisma_generic kernel")
-    g.add_argument("--no-top10", action="store_true", dest="no_top10",
-                   help="skip prisma_top10 per-matrix specialized kernel")
-    g.add_argument("--top-n", type=int, default=10, dest="top_n",
-                   help="number of top shapes to specialise per matrix (default: 10)")
+    g.add_argument(
+        "--no-compile",
+        action="store_true",
+        help="skip compilation; binaries must already exist in work-dir",
+    )
+    g.add_argument(
+        "--blas",
+        action="store_true",
+        help="link BLAS when compiling prisma (enables BLAS tile path)",
+    )
+    g.add_argument(
+        "--no-taco", action="store_true", dest="no_taco", help="skip both TACO kernels"
+    )
+    g.add_argument(
+        "--no-prisma",
+        action="store_true",
+        dest="no_prisma",
+        help="skip all Prisma kernels",
+    )
+    g.add_argument(
+        "--no-generic",
+        action="store_true",
+        dest="no_generic",
+        help="skip prisma_generic kernel",
+    )
+    g.add_argument(
+        "--no-top10",
+        action="store_true",
+        dest="no_top10",
+        help="skip prisma_top10 per-matrix specialized kernel",
+    )
+    g.add_argument(
+        "--no-top10-panels",
+        action="store_true",
+        dest="no_top10_panels",
+        help="skip prisma_top10_panels (same specialized kernel as prisma_top10, "
+             "but with --merge-strategy panels -- the row-panel-parallel "
+             "merge_overlapping_output_blocks, see core/pipeline.hpp)",
+    )
+    g.add_argument(
+        "--top-n",
+        type=int,
+        default=10,
+        dest="top_n",
+        help="number of top shapes to specialise per matrix (default: 10)",
+    )
 
     return p.parse_args()
 
@@ -623,25 +777,35 @@ def parse_args():
 def main() -> None:
     args = parse_args()
 
-    work_dir = (
-        Path(args.work_dir) if args.work_dir
-        else Path(tempfile.mkdtemp(prefix="ss_spgemm_bench_"))
-    )
+    work_dir = Path(args.work_dir) if args.work_dir else _TMP_DIR
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    taco_bin:     Path | None = None
+    taco_bin: Path | None = None
     taco_opt_bin: Path | None = None
-    prisma_bin:   Path | None = None
+    prisma_bin: Path | None = None
 
     if args.no_compile:
         if not args.no_taco:
-            taco_bin     = Path(args.taco_bin)     if args.taco_bin     else work_dir / "bench_taco_cpu"
-            taco_opt_bin = Path(args.taco_opt_bin) if args.taco_opt_bin else work_dir / "bench_taco_cpu_opt"
-            if not taco_bin.exists():     taco_bin     = None
-            if not taco_opt_bin.exists(): taco_opt_bin = None
+            taco_bin = (
+                Path(args.taco_bin) if args.taco_bin else work_dir / "bench_taco_cpu"
+            )
+            taco_opt_bin = (
+                Path(args.taco_opt_bin)
+                if args.taco_opt_bin
+                else work_dir / "bench_taco_cpu_opt"
+            )
+            if not taco_bin.exists():
+                taco_bin = None
+            if not taco_opt_bin.exists():
+                taco_opt_bin = None
         if not args.no_prisma:
-            prisma_bin = Path(args.prisma_bin) if args.prisma_bin else work_dir / "prisma_cpu_bench"
-            if not prisma_bin.exists(): prisma_bin = None
+            prisma_bin = (
+                Path(args.prisma_bin)
+                if args.prisma_bin
+                else work_dir / "prisma_cpu_bench"
+            )
+            if not prisma_bin.exists():
+                prisma_bin = None
     else:
         print("Compiling:")
         if not args.no_taco:
@@ -650,7 +814,8 @@ def main() -> None:
             else:
                 try:
                     taco_bin = compile_taco_cpu(
-                        "taco_kernel.h", work_dir / "bench_taco_cpu", args.threads)
+                        "taco_kernel.h", work_dir / "bench_taco_cpu", args.threads
+                    )
                 except RuntimeError as e:
                     print(f"  bench_taco_cpu failed — skipping: {e}")
             if args.taco_opt_bin:
@@ -658,7 +823,10 @@ def main() -> None:
             else:
                 try:
                     taco_opt_bin = compile_taco_cpu(
-                        "taco_kernel_opt.h", work_dir / "bench_taco_cpu_opt", args.threads)
+                        "taco_kernel_opt.h",
+                        work_dir / "bench_taco_cpu_opt",
+                        args.threads,
+                    )
                 except RuntimeError as e:
                     print(f"  bench_taco_cpu_opt failed — skipping: {e}")
         if not args.no_prisma:
@@ -667,7 +835,8 @@ def main() -> None:
             else:
                 try:
                     prisma_bin = compile_prisma_spgemm(
-                        work_dir / "prisma_cpu_bench", args.blas)
+                        work_dir / "prisma_cpu_bench", args.blas
+                    )
                 except RuntimeError as e:
                     print(f"  prisma_cpu_bench failed — skipping: {e}")
         print()
@@ -677,9 +846,9 @@ def main() -> None:
     csv_path = Path(args.out)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"TACO CPU bin   : {taco_bin     or '(disabled)'}")
+    print(f"TACO CPU bin   : {taco_bin or '(disabled)'}")
     print(f"TACO opt bin   : {taco_opt_bin or '(disabled)'}")
-    print(f"Prisma bin     : {prisma_bin   or '(disabled)'}")
+    print(f"Prisma bin     : {prisma_bin or '(disabled)'}")
     print(f"Top-N shapes   : {args.top_n}  (per-matrix specialized)")
     print(f"Output CSV     : {csv_path}")
     print(f"Matrices       : {len(matrices)}")
@@ -693,7 +862,9 @@ def main() -> None:
     write_header = _needs_header(csv_path)
     with open(csv_path, "a", newline="") as f_csv:
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        f_csv.write(f"# {ts}  input={args.csv}  runs={args.runs}  threads={args.threads}\n")
+        f_csv.write(
+            f"# {ts}  input={args.csv}  runs={args.runs}  threads={args.threads}\n"
+        )
         writer = csv.DictWriter(
             f_csv, fieldnames=_CSV_FIELDS, extrasaction="ignore", lineterminator="\n"
         )
@@ -725,6 +896,7 @@ def main() -> None:
                     f_csv=f_csv,
                     run_generic=not args.no_generic and not args.no_prisma,
                     run_top10=not args.no_top10 and not args.no_prisma,
+                    run_top10_panels=not args.no_top10_panels and not args.no_prisma,
                     top_n=args.top_n,
                     blas=args.blas,
                     work_dir=work_dir,

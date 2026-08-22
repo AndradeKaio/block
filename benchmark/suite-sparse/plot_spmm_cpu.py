@@ -2,9 +2,12 @@
 """
 plot_spmm.py — Plot suite-sparse SpMM benchmark results.
 
+Produces a 1x2 grid: total time on the left, compute time only on the
+right, sharing one legend.
+
 X-axis : matrices ordered by NNZ (ascending)
-Y-axis : average total_ms across timed runs
-Columns: one scatter point per matrix, one color per contender
+Y-axis : mean time per run [ms], log scale
+Columns: one scatter point per contender per matrix
 
 Usage:
   python plot_spmm.py --file spmm_results.csv
@@ -17,6 +20,7 @@ import sys
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # ---------------------------------------------------------------------------
 # Visual settings
@@ -39,11 +43,11 @@ KERNEL_DISPLAY = {
     "taco":                "TACO",
     "taco_opt0":            "TACO opt0",
     "taco_opt1":            "TACO opt1",
-    "prisma_cpu":           "PRISMA (CPU)",
-    "prisma_auto":          "PRISMA (auto)",
-    "prisma_specialized":   "PRISMA (specialized)",
-    "prisma_static":        "PRISMA (static sched)",
-    "prisma_tiled":         "PRISMA (tiled)",
+    "prisma_cpu":           "BLOCKS (CPU)",
+    "prisma_auto":          "BLOCKS (auto)",
+    "prisma_specialized":   "BLOCKS (specialized)",
+    "prisma_static":        "BLOCKS (static sched)",
+    "prisma_tiled":         "BLOCKS (tiled)",
 }
 
 DEFAULT_COLOR = "#7f7f7f"
@@ -63,8 +67,6 @@ def parse_args():
                    help="Include warmup run (run_id == 0) in the average")
     p.add_argument("--out", default=None,
                    help="Save HTML to this path (also opens in browser if omitted)")
-    p.add_argument("--total-time", action="store_true", default=False, dest="total_time",
-                   help="Plot total time (symbolic + compute) instead of compute time only")
     p.add_argument("--show", action="store_true", default=False,
                    help="Open in browser even when --out is given")
     p.add_argument("--note", default="",
@@ -107,48 +109,23 @@ def build_stats(df: pd.DataFrame, time_col: str) -> pd.DataFrame:
 # Plot
 # ---------------------------------------------------------------------------
 
-def make_figure(stats: pd.DataFrame, time_label: str, note: str = "") -> go.Figure:
-    # X order: matrices sorted by NNZ ascending
-    matrix_order = (
-        stats[["matrix_name", "nnz"]]
-        .drop_duplicates()
-        .sort_values("nnz")
-        ["matrix_name"]
-        .tolist()
-    )
 
-    # NNZ labels for x-axis ticks
-    nnz_map = (
-        stats[["matrix_name", "nnz"]]
-        .drop_duplicates()
-        .set_index("matrix_name")["nnz"]
-        .to_dict()
-    )
+def _fmt_nnz(v):
+    if v >= 1_000_000_000: return f"{v/1e9:.1f}B"
+    if v >= 1_000_000:     return f"{v/1e6:.1f}M"
+    if v >= 1_000:         return f"{v/1e3:.0f}K"
+    return str(int(v))
 
-    def fmt_nnz(v):
-        if v >= 1_000_000_000: return f"{v/1e9:.1f}B"
-        if v >= 1_000_000:     return f"{v/1e6:.1f}M"
-        if v >= 1_000:         return f"{v/1e3:.0f}K"
-        return str(int(v))
 
-    n = len(matrix_order)
-    step = max(1, round(n / 10))
-    tick_vals   = list(range(0, n, step))
-    tick_labels = [fmt_nnz(nnz_map[matrix_order[i]]) for i in tick_vals]
-
-    kernels_in_data = stats["kernel"].unique().tolist()
-    kernels_ordered = [k for k in KERNEL_COLORS if k in kernels_in_data] + \
-                      [k for k in sorted(kernels_in_data) if k not in KERNEL_COLORS]
-
-    fig = go.Figure()
-    seen = set()
-
+def _add_panel(fig: go.Figure, stats: pd.DataFrame, matrix_order: list,
+              nnz_map: dict, kernels_ordered: list, col: int,
+              show_legend: bool) -> None:
     for kernel in kernels_ordered:
         kdf = stats[stats["kernel"] == kernel].set_index("matrix_name")
+        if kdf.empty:
+            continue
         color        = KERNEL_COLORS.get(kernel, DEFAULT_COLOR)
         display_name = KERNEL_DISPLAY.get(kernel, kernel)
-        show_legend  = kernel not in seen
-        seen.add(kernel)
 
         means  = [kdf.loc[m, "mean_ms"] if m in kdf.index else None for m in matrix_order]
         lowers = [
@@ -192,33 +169,81 @@ def make_figure(stats: pd.DataFrame, time_label: str, note: str = "") -> go.Figu
             marker=dict(color=color, size=9, opacity=0.9),
             hovertemplate="%{customdata}<extra></extra>",
             customdata=hover,
-        ))
+        ), row=1, col=col)
+
+
+def make_figure(stats_total: pd.DataFrame, stats_compute: pd.DataFrame,
+                note: str = "") -> go.Figure:
+    basis = stats_total if not stats_total.empty else stats_compute
+    matrix_order = (
+        basis[["matrix_name", "nnz"]]
+        .drop_duplicates()
+        .sort_values("nnz")
+        ["matrix_name"]
+        .tolist()
+    )
+    nnz_map = (
+        basis[["matrix_name", "nnz"]]
+        .drop_duplicates()
+        .set_index("matrix_name")["nnz"]
+        .to_dict()
+    )
+
+    n = len(matrix_order)
+    step = max(1, round(n / 10))
+    tick_vals   = list(range(0, n, step))
+    tick_labels = [_fmt_nnz(nnz_map[matrix_order[i]]) for i in tick_vals]
+
+    kernels_in_data = set(stats_total["kernel"].unique().tolist()) | set(
+        stats_compute["kernel"].unique().tolist()
+    )
+    kernels_ordered = [k for k in KERNEL_COLORS if k in kernels_in_data] + \
+                      [k for k in sorted(kernels_in_data) if k not in KERNEL_COLORS]
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=("Total time", "Compute time only"),
+        horizontal_spacing=0.08,
+    )
+
+    # Legend entries shown once, preferring the left (total-time) panel.
+    legend_shown = set()
+    for col, stats in ((1, stats_total), (2, stats_compute)):
+        present = set(stats["kernel"].unique().tolist())
+        for kernel in kernels_ordered:
+            if kernel not in present:
+                continue
+            show = kernel not in legend_shown
+            legend_shown.add(kernel)
+            _add_panel(fig, stats[stats["kernel"] == kernel], matrix_order,
+                      nnz_map, [kernel], col, show_legend=show)
+
+    fig.update_xaxes(
+        tickmode="array", tickvals=tick_vals, ticktext=tick_labels,
+        title="NNZ (ordered ascending)", gridcolor="#e0e0e0", row=1, col=1,
+    )
+    fig.update_xaxes(
+        tickmode="array", tickvals=tick_vals, ticktext=tick_labels,
+        title="NNZ (ordered ascending)", gridcolor="#e0e0e0", row=1, col=2,
+    )
+    fig.update_yaxes(title="Mean time [ms]", gridcolor="#e0e0e0", type="log",
+                     row=1, col=1)
+    fig.update_yaxes(title="Mean time [ms]", gridcolor="#e0e0e0", type="log",
+                     row=1, col=2)
 
     fig.update_layout(
         title=dict(
-            text=f"SuiteSparse CPU SpMM benchmark — {time_label}"
+            text="SuiteSparse CPU SpMM benchmark"
             + (f" — {note}" if note else ""),
             font=dict(size=17),
             x=0.5,
         ),
-        xaxis=dict(
-            tickmode="array",
-            tickvals=tick_vals,
-            ticktext=tick_labels,
-            title="NNZ (ordered ascending)",
-            gridcolor="#e0e0e0",
-        ),
-        yaxis=dict(
-            title=f"Mean {time_label} [ms]",
-            gridcolor="#e0e0e0",
-            type="log",
-        ),
         legend=dict(
             orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1,
+            yanchor="top",
+            y=-0.22,
+            xanchor="center",
+            x=0.5,
             font=dict(size=14),
             bgcolor="rgba(255,255,255,0.85)",
             bordercolor="#cccccc",
@@ -226,7 +251,7 @@ def make_figure(stats: pd.DataFrame, time_label: str, note: str = "") -> go.Figu
         ),
         plot_bgcolor="white",
         paper_bgcolor="white",
-        margin=dict(l=70, r=30, t=90, b=140),
+        margin=dict(l=70, r=30, t=90, b=180),
         hoverlabel=dict(bgcolor="white", font_size=13),
     )
 
@@ -237,24 +262,8 @@ def make_figure(stats: pd.DataFrame, time_label: str, note: str = "") -> go.Figu
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    args  = parse_args()
-    df    = load(args.file, include_warmup=args.warmup)
 
-    if df.empty:
-        sys.exit("No valid rows after filtering — nothing to plot.")
-
-    time_col   = "total_ms"   if args.total_time else "compute_ms"
-    time_label = "total time" if args.total_time else "compute time"
-
-    stats = build_stats(df, time_col)
-
-    print(f"Matrices : {stats['matrix_name'].nunique()}")
-    print(f"Kernels  : {sorted(stats['kernel'].unique())}")
-    print(f"Warmup   : {'included' if args.warmup else 'excluded (run_id=0)'}")
-    print(f"Timing   : {time_label} ({time_col})")
-
-    # Report matrices where at least one contender has no valid runs
+def _report_missing(df: pd.DataFrame, time_col: str) -> None:
     all_kernels = df["kernel"].unique()
     failed = (
         df.groupby(["matrix_name", "kernel"])[time_col]
@@ -262,7 +271,6 @@ def main():
           .reset_index(name="failed")
     )
     failed = failed[failed["failed"]]
-    # Also flag matrices missing entirely for a kernel
     all_pairs = pd.MultiIndex.from_product(
         [df["matrix_name"].unique(), all_kernels], names=["matrix_name", "kernel"]
     )
@@ -275,13 +283,31 @@ def main():
             subset=["matrix_name", "kernel"]
         )
     if not failed.empty:
-        print("\nFailed / no valid data:")
+        print(f"\nFailed / no valid data ({time_col}):")
         for mat, grp in failed.groupby("matrix_name"):
             kernels_failed = ", ".join(sorted(grp["kernel"].tolist()))
             print(f"  {mat}: {kernels_failed}")
+
+
+def main():
+    args  = parse_args()
+    df    = load(args.file, include_warmup=args.warmup)
+
+    if df.empty:
+        sys.exit("No valid rows after filtering — nothing to plot.")
+
+    stats_total   = build_stats(df, "total_ms")
+    stats_compute = build_stats(df, "compute_ms")
+
+    print(f"Matrices : {df['matrix_name'].nunique()}")
+    print(f"Kernels  : {sorted(df['kernel'].unique())}")
+    print(f"Warmup   : {'included' if args.warmup else 'excluded (run_id=0)'}")
+    print("Timing   : total time (left panel) + compute time (right panel)")
+
+    _report_missing(df, "compute_ms")
     print()
 
-    fig = make_figure(stats, time_label, note=args.note)
+    fig = make_figure(stats_total, stats_compute, note=args.note)
 
     if args.out:
         fig.write_html(args.out, include_plotlyjs="cdn")

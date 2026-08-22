@@ -45,8 +45,13 @@ import scipy.sparse
 _SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(_SCRIPT_DIR))
 
-from benchmark_spgemm_cpu import find_mtx, load_matrix_list  # noqa: E402
+from benchmark_spgemm_cpu import (  # noqa: E402
+    ensure_real_general,
+    find_mtx,
+    load_matrix_list,
+)
 from benchmark_spgemm_gpu import (  # noqa: E402
+    _TMP_DIR,
     compile_prisma_bench,
     compile_taco_gpu,
     compile_tc_spgemm,
@@ -55,6 +60,7 @@ from validate_spgemm_cpu import (  # noqa: E402
     _compare,
     _load_bsp_as_csr,
     _load_coo,
+    _top_failures,
     _DEFAULT_MATRICES,
 )
 
@@ -74,6 +80,57 @@ _ALL_LABELS = _ARRAY_CONTENDERS + ["cusparse"]
 _DEFAULT_TILESPGEMM_DIR = "/home/kaio/artifacts/TileSpGEMM/src"
 _DEFAULT_CUDA_HOME = "/usr/local/cuda"
 _DEFAULT_ARCH = "sm_120"
+
+
+def _parse_dump_plan(path: Path) -> list[dict]:
+    """Parse prisma_bench.cu's --dump-plan output: one region per line
+    (type, fused_id, row_start, row_end, col_start, col_end, k_count)."""
+    regions = []
+    if not path.exists():
+        return regions
+    with open(path) as f:
+        for line in f:
+            if line.startswith("#") or not line.strip():
+                continue
+            parts = line.split()
+            if len(parts) != 7:
+                continue
+            kind, fid, r0, r1, c0, c1, kc = parts
+            regions.append({
+                "type": kind, "fused_id": int(fid),
+                "row_start": int(r0), "row_end": int(r1),
+                "col_start": int(c0), "col_end": int(c1),
+                "k_count": int(kc),
+            })
+    return regions
+
+
+def _regions_covering(regions: list[dict], row: int, col: int) -> list[dict]:
+    return [r for r in regions
+            if r["row_start"] <= row < r["row_end"]
+            and r["col_start"] <= col < r["col_end"]]
+
+
+def _print_top_failures(C: np.ndarray, C_ref: np.ndarray, rtol: float,
+                        atol: float, regions: list[dict] | None = None) -> None:
+    """Print a few worst-offending (row, col) cells for a FAIL. If `regions`
+    (from prisma_bench.cu's --dump-plan) is given, also print which compute
+    region(s) cover each failing cell -- traces a wrong cell back to the
+    exact region that produced it, to tell apart a bug in SubRegion
+    construction (shared by all --tc-kernel variants) from a specific
+    compute kernel."""
+    for r, c, got, ref in _top_failures(C, C_ref, rtol, atol):
+        print(f"    ({r}, {c}): got={got:.6g}  ref={ref:.6g}  "
+              f"diff={abs(got - ref):.6g}")
+        if regions:
+            hits = _regions_covering(regions, r, c)
+            if not hits:
+                print("      (no covering region found in --dump-plan output)")
+            for h in hits:
+                print(f"      region: type={h['type']}  fused_id={h['fused_id']}  "
+                      f"rows=[{h['row_start']},{h['row_end']})  "
+                      f"cols=[{h['col_start']},{h['col_end']})  "
+                      f"k_count={h['k_count']}")
 
 
 def _load_mtx(path: Path, M: int, N: int) -> tuple[np.ndarray | None, str | None]:
@@ -175,19 +232,24 @@ def validate_matrix(
             continue
         print(f"  [{label:<22}] ", end="", flush=True)
         vf = tmp / f"{name}_C_{label}.coo"
-        r = _run([prisma_bin, bsp, bsp, *extra_flags, "--validate", vf])
+        pf = tmp / f"{name}_plan_{label}.txt"
+        r = _run([prisma_bin, bsp, bsp, *extra_flags,
+                  "--validate", vf, "--dump-plan", pf])
         if r is None:
             print("TIMEOUT")
             all_pass = False
             continue
         if r.returncode != 0:
             print(f"FAILED (exit {r.returncode})")
+            if r.stderr.strip():
+                print(f"    stderr: {r.stderr.strip()[-800:]}")
             all_pass = False
             continue
         if not vf.exists():
             print("FAILED (no output file written)")
             all_pass = False
             continue
+        regions = _parse_dump_plan(pf)
         C = _load_coo(vf, M, N)
         results[label] = C
         ok, max_err, max_rel, failures = _compare(C, C_ref, rtol, atol)
@@ -196,6 +258,7 @@ def validate_matrix(
         else:
             print(f"FAIL  max_err={max_err:.3g}  max_rel={max_rel:.3g}  "
                   f"failures={failures}/{C.size}")
+            _print_top_failures(C, C_ref, rtol, atol, regions=regions)
             all_pass = False
 
     # --- TileSpGEMM (+ inline cuSPARSE verdict) -------------------------------
@@ -207,8 +270,15 @@ def validate_matrix(
             if "cusparse" in active:
                 print("  [cusparse             ] SKIP (no TileSpGEMM binary)")
         else:
+            # TileSpGEMM is external/third-party code with no symmetric- or
+            # pattern-format handling of its own (unlike bench_taco_gpu.cu/
+            # bench_tc_spgemm.cu, which both have their own is_pattern/
+            # is_symmetric expansion) -- fed the raw suite-sparse .mtx
+            # directly it fails on every symmetric/pattern matrix. Convert
+            # first, same as benchmark_spgemm_gpu.py now does.
+            tile_mtx = ensure_real_general(mtx, tmp)
             c_tile = tmp / f"{name}_C_tilespgemm.mtx"
-            tile_r = _run([tilespgemm_bin, "-d", device, mtx, mtx, "-o", c_tile])
+            tile_r = _run([tilespgemm_bin, "-d", device, tile_mtx, tile_mtx, "-o", c_tile])
             if "tilespgemm" in active:
                 print("  [tilespgemm           ] ", end="", flush=True)
                 if tile_r is None:
@@ -216,6 +286,8 @@ def validate_matrix(
                     all_pass = False
                 elif tile_r.returncode != 0:
                     print(f"FAILED (exit {tile_r.returncode})")
+                    if tile_r.stderr.strip():
+                        print(f"    stderr: {tile_r.stderr.strip()[-800:]}")
                     all_pass = False
                 elif not c_tile.exists():
                     print("FAILED (no output file written)")
@@ -233,6 +305,7 @@ def validate_matrix(
                         else:
                             print(f"FAIL  max_err={max_err:.3g}  max_rel={max_rel:.3g}  "
                                   f"failures={failures}/{C.size}")
+                            _print_top_failures(C, C_ref, rtol, atol)
                             all_pass = False
             if "cusparse" in active:
                 print("  [cusparse             ] ", end="", flush=True)
@@ -253,13 +326,19 @@ def validate_matrix(
             print("  [taco_gpu             ] SKIP (no bench_taco_gpu binary)")
         else:
             print("  [taco_gpu             ] ", end="", flush=True)
+            # bench_taco_gpu.cu's read_mtx() has no symmetric/pattern
+            # expansion (same limitation as SpGEMM CPU's bench_taco.c) --
+            # convert first, same as TileSpGEMM above.
+            taco_mtx = ensure_real_general(mtx, tmp)
             c_taco = tmp / f"{name}_C_taco_gpu.mtx"
-            r = _run([taco_bin, mtx, mtx, "--output", c_taco])
+            r = _run([taco_bin, taco_mtx, taco_mtx, "--output", c_taco])
             if r is None:
                 print("TIMEOUT")
                 all_pass = False
             elif r.returncode != 0:
                 print(f"FAILED (exit {r.returncode})")
+                if r.stderr.strip():
+                    print(f"    stderr: {r.stderr.strip()[-800:]}")
                 all_pass = False
             elif not c_taco.exists():
                 print("FAILED (no output file written)")
@@ -277,6 +356,7 @@ def validate_matrix(
                     else:
                         print(f"FAIL  max_err={max_err:.3g}  max_rel={max_rel:.3g}  "
                               f"failures={failures}/{C.size}")
+                        _print_top_failures(C, C_ref, rtol, atol)
                         all_pass = False
 
     # --- TC_SpGEMM (reads .mtx) -----------------------------------------------
@@ -285,13 +365,17 @@ def validate_matrix(
             print("  [tc_spgemm            ] SKIP (no bench_tc_spgemm binary)")
         else:
             print("  [tc_spgemm            ] ", end="", flush=True)
+            # Same reader limitation as bench_taco_gpu.cu -- see comment above.
+            tc_mtx = ensure_real_general(mtx, tmp)
             c_tc = tmp / f"{name}_C_tc_spgemm.mtx"
-            r = _run([tc_spgemm_bin, mtx, mtx, "--output", c_tc])
+            r = _run([tc_spgemm_bin, tc_mtx, tc_mtx, "--output", c_tc])
             if r is None:
                 print("TIMEOUT")
                 all_pass = False
             elif r.returncode != 0:
                 print(f"FAILED (exit {r.returncode})")
+                if r.stderr.strip():
+                    print(f"    stderr: {r.stderr.strip()[-800:]}")
                 all_pass = False
             elif not c_tc.exists():
                 print("FAILED (no output file written)")
@@ -309,6 +393,7 @@ def validate_matrix(
                     else:
                         print(f"FAIL  max_err={max_err:.3g}  max_rel={max_rel:.3g}  "
                               f"failures={failures}/{C.size}")
+                        _print_top_failures(C, C_ref, rtol, atol)
                         all_pass = False
 
     # --- Cross-compare all captured outputs -----------------------------------
@@ -350,7 +435,7 @@ def parse_args():
     p.add_argument("csv", metavar="MATRICES.csv", nargs="?", default=None,
                    help="input CSV with at least a 'name' column")
     p.add_argument("--bin-dir", default="", dest="bin_dir",
-                   help="directory for compiled binaries (default: temp dir)")
+                   help=f"directory for compiled binaries (default: {_TMP_DIR})")
     p.add_argument("--no-compile", action="store_true",
                    help="skip compilation; binaries must already exist in --bin-dir")
     p.add_argument("--prisma-bin", default="", dest="prisma_bin",
@@ -381,7 +466,7 @@ def parse_args():
 def main() -> None:
     args = parse_args()
 
-    bin_dir = Path(args.bin_dir) if args.bin_dir else Path(tempfile.mkdtemp(prefix="validate_spgemm_gpu_bin_"))
+    bin_dir = Path(args.bin_dir) if args.bin_dir else _TMP_DIR
     bin_dir.mkdir(parents=True, exist_ok=True)
 
     active = [l for l in _ALL_LABELS if l in args.kernels.split(",")] if args.kernels else list(_ALL_LABELS)
