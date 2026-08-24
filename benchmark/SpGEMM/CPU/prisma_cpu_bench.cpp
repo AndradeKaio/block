@@ -19,7 +19,7 @@ namespace {
 // double, matching TACO's own bench_taco.c (Bv/Cv/A_t->vals are all
 // `double`) -- was float; switched so the two are comparable at a tight
 // tolerance instead of only "within float32 precision". See
-// gen_spgemm_kernels.py's docstring for the matching codegen change.
+// core/gen_kernel.py's docstring for the matching codegen change.
 using Scalar = double;
 using Clock = std::chrono::steady_clock;
 
@@ -31,27 +31,12 @@ struct Args {
   bool specialized = false;
   int print_shapes = 0;
   bool histogram = false;
-  std::string merge_strategy = "sequential";
 };
 
 void print_usage(const char *prog) {
   std::fprintf(stderr,
                "Usage: %s <A.bsp> <B.bsp> [--runs N] [--validate FILE] "
-               "[--specialized-kernels] [--print-shapes N] [--histogram] "
-               "[--merge-strategy sequential|panels]\n"
-               "  --merge-strategy  Which merge_overlapping_output_blocks "
-               "implementation the timed\n"
-               "                    per-run symbolic phase uses (identical "
-               "grouping either way):\n"
-               "    sequential  (default) single global sweep-line + "
-               "union-find pass.\n"
-               "    panels      Row-panel output_blocks first (an output "
-               "block's row range is\n"
-               "                always its A-block's row range, so "
-               "row-disjoint panels can never\n"
-               "                share a group), then run one independent "
-               "sweep per panel in\n"
-               "                parallel via OpenMP.\n",
+               "[--specialized-kernels] [--print-shapes N] [--histogram]\n",
                prog);
 }
 
@@ -82,13 +67,7 @@ Args parse_args(int argc, char **argv) {
       args.print_shapes = std::atoi(next());
     else if (arg == "--histogram")
       args.histogram = true;
-    else if (arg == "--merge-strategy") {
-      args.merge_strategy = next();
-      if (args.merge_strategy != "sequential" && args.merge_strategy != "panels") {
-        std::fprintf(stderr, "--merge-strategy must be sequential|panels\n");
-        std::exit(1);
-      }
-    } else if (arg == "--help" || arg == "-h") {
+    else if (arg == "--help" || arg == "-h") {
       print_usage(argv[0]);
       std::exit(0);
     } else {
@@ -209,7 +188,6 @@ int main(int argc, char **argv) {
   }
 
   std::printf("kernel: %s\n", args.specialized ? "specialized" : "generic");
-  std::printf("merge-strategy: %s\n", args.merge_strategy.c_str());
 
   // Every timed run redoes the full symbolic pipeline (intersect -> merge ->
   // fuse -> plan_build) from scratch instead of reusing the `fused`/`plan`
@@ -236,9 +214,8 @@ int main(int argc, char **argv) {
     auto ts0 = Clock::now();
     auto found_r = benchmark_core::find_intersecting_pairs(A.blocks, B.blocks);
     auto ts1 = Clock::now();
-    auto groups_r = args.merge_strategy == "panels"
-        ? benchmark_core::merge_overlapping_output_blocks_panels(found_r.output_blocks)
-        : benchmark_core::merge_overlapping_output_blocks(found_r.output_blocks);
+    auto groups_r =
+        benchmark_core::merge_overlapping_output_blocks(found_r.output_blocks);
     auto ts2 = Clock::now();
     auto fused_r = benchmark_core::block_fusion(found_r.output_blocks,
                                                 found_r.contributions, groups_r);
@@ -278,8 +255,12 @@ int main(int argc, char **argv) {
                      "prisma_cpu_bench: cannot open validate file: %s\n",
                      args.validate.c_str());
       } else {
+        // %.17g, not %.8e: full double round-trip precision, and matches
+        // bench_taco.c's dump_csr_coo format exactly -- so a byte-for-byte
+        // `diff` between the two contenders' dumps is meaningful instead of
+        // reporting spurious mismatches from differing print precision.
         for (const auto &[rr, cc, v] : entries)
-          std::fprintf(vf, "%d %d %.8e\n", rr, cc, v);
+          std::fprintf(vf, "%d %d %.17g\n", rr, cc, v);
         std::fclose(vf);
         std::printf("validate: wrote %zu non-zeros to %s\n", entries.size(),
                     args.validate.c_str());
@@ -346,7 +327,6 @@ int main(int argc, char **argv) {
   std::printf("  \"kernel\": \"prisma_cpu\",\n");
   std::printf("  \"n_pairs\": %zu, \"n_groups\": %zu,\n",
               found.contributions.size(), fused.fused_blocks.size());
-  std::printf("  \"merge_strategy\": \"%s\",\n", args.merge_strategy.c_str());
   std::printf("  \"symbolic_ms\": ");
   print_arr(symbolic_ms_arr);
   std::printf(",\n");

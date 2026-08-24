@@ -25,11 +25,13 @@
 #include "matrix.hpp"
 #include "matrix_io.hpp"
 #include "pipeline.hpp"
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -41,6 +43,7 @@ struct Args {
   std::string b_bsp;
   std::string tc_kernel; // "tile", "block", or "" (CUDA-only)
   std::string validate;  // if non-empty, dump C as sorted COO to this path
+  std::string dump_plan; // if non-empty, dump per-region (row,col) footprints
   int runs = 10;
 };
 
@@ -48,10 +51,15 @@ void print_usage(const char *prog) {
   std::fprintf(
       stderr,
       "Usage: %s <A.bsp> <B.bsp> [--runs N] [--tc-kernel tile|block]"
-      " [--validate FILE]\n"
+      " [--validate FILE] [--dump-plan FILE]\n"
       "  Reads two .bsp files and benchmarks PRISMA block-sparse GEMM.\n"
       "  For A\xc3\x97A squaring, pass the same path for both arguments.\n"
-      "  --validate FILE  After the last run, dump C as sorted COO to FILE.\n"
+      "  --validate FILE   After the last run, dump C as sorted COO to FILE.\n"
+      "  --dump-plan FILE  Dump one line per CUDA/TC compute region: its\n"
+      "                    fused-block id, absolute [row_start,row_end) x\n"
+      "                    [col_start,col_end) footprint, and k_count --\n"
+      "                    lets a failing output cell (row,col) be traced\n"
+      "                    back to the exact region that produced it.\n"
       "  Exits non-zero if either .bsp file is missing.\n",
       prog);
 }
@@ -79,6 +87,8 @@ Args parse_args(int argc, char **argv) {
       args.tc_kernel = next();
     else if (arg == "--validate")
       args.validate = next();
+    else if (arg == "--dump-plan")
+      args.dump_plan = next();
     else if (arg == "--help" || arg == "-h") {
       print_usage(argv[0]);
       std::exit(0);
@@ -254,6 +264,74 @@ int main(int argc, char **argv) {
       std::fclose(vf);
       std::printf("validate: wrote %zu non-zeros to %s\n", entries.size(),
                   args.validate.c_str());
+    }
+  }
+
+  // ── Optional plan dump: per-region (row,col) footprints ─────────────────
+  // Diagnostic only. gpu_kernel_plan (core/gpu_pipeline.hpp) partitions each
+  // fused block into disjoint (A-row-range, B-col-range) SubRegions, each
+  // becoming one CudaDesc/TcDesc; C_ptr is a raw offset into C.values with
+  // no absolute (row,col) recorded anywhere in the plan. This traces a
+  // desc's C_ptr back to (fused_block_id, absolute row/col footprint) via
+  // binary search over C.blocks, so a specific failing output cell (from
+  // validate_spgemm_gpu.py) can be matched to the exact region that wrote
+  // it -- useful for isolating whether a bug is in SubRegion construction
+  // (shared by all --tc-kernel variants) vs a specific compute kernel.
+  if (!args.dump_plan.empty()) {
+    struct BlockOff {
+      long long start;
+      int idx;
+    };
+    std::vector<BlockOff> sorted_offs;
+    sorted_offs.reserve(C.blocks.size());
+    for (int i = 0; i < (int)C.blocks.size(); ++i)
+      sorted_offs.push_back({C.blocks[i].offset, i});
+    std::sort(sorted_offs.begin(), sorted_offs.end(),
+              [](const BlockOff &a, const BlockOff &b) {
+                return a.start < b.start;
+              });
+
+    auto locate = [&](const Scalar *ptr) -> std::tuple<int, int, int> {
+      const long long off = ptr - C.values;
+      auto it = std::upper_bound(
+          sorted_offs.begin(), sorted_offs.end(), off,
+          [](long long v, const BlockOff &b) { return v < b.start; });
+      if (it == sorted_offs.begin())
+        return {-1, -1, -1};
+      --it;
+      const auto &blk = C.blocks[it->idx];
+      const long long rel = off - blk.offset;
+      const int row_off = (int)(rel / blk.w);
+      const int col_off = (int)(rel % blk.w);
+      return {it->idx, blk.r + row_off, blk.c + col_off};
+    };
+
+    FILE *pf = std::fopen(args.dump_plan.c_str(), "w");
+    if (!pf) {
+      std::fprintf(stderr, "prisma_bench: cannot open dump-plan file: %s\n",
+                   args.dump_plan.c_str());
+    } else {
+      std::fprintf(pf,
+                   "# type fused_id row_start row_end col_start col_end "
+                   "k_count\n");
+      for (int i = 0; i < (int)plan.cuda_descs.size(); ++i) {
+        const auto &desc = plan.cuda_descs[i];
+        const auto &k0 = plan.k_entries[desc.k_start];
+        auto [fid, row, col] = locate(k0.C_ptr);
+        std::fprintf(pf, "CUDA %d %d %d %d %d %d\n", fid, row, row + k0.M,
+                     col, col + k0.N, desc.k_count);
+      }
+      for (int i = 0; i < (int)plan.tc_descs.size(); ++i) {
+        const auto &desc = plan.tc_descs[i];
+        const auto &k0 = plan.k_entries[desc.k_start];
+        auto [fid, row, col] = locate(k0.C_ptr);
+        std::fprintf(pf, "TC %d %d %d %d %d %d\n", fid, row, row + desc.M,
+                     col, col + desc.N, desc.k_count);
+      }
+      std::fclose(pf);
+      std::printf("dump-plan: wrote %zu cuda + %zu tc regions to %s\n",
+                  plan.cuda_descs.size(), plan.tc_descs.size(),
+                  args.dump_plan.c_str());
     }
   }
 
