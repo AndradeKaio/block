@@ -67,8 +67,8 @@ IntersectionResult find_intersecting_pairs(const std::vector<Block> &a_blocks,
     timings->query_ms      = query_ms;
   }
 
-  // Merge per-thread results. The ordering of contributions differs from the
-  // sequential case; merge_overlapping_output_blocks is invariant to this.
+  // Merge per-thread results. Ordering is nondeterministic across thread
+  // counts; merge_overlapping_output_blocks is invariant to it.
   IntersectionResult result;
   for (auto &r : per_thread) {
     result.contributions.insert(result.contributions.end(),
@@ -81,80 +81,6 @@ IntersectionResult find_intersecting_pairs(const std::vector<Block> &a_blocks,
 
 std::vector<Group>
 merge_overlapping_output_blocks(const std::vector<Block> &output_blocks) {
-  const int n = static_cast<int>(output_blocks.size());
-
-  std::vector<int> parent(n);
-  std::iota(parent.begin(), parent.end(), 0);
-
-  auto find = [&](int x) {
-    while (parent[x] != x) {
-      parent[x] = parent[parent[x]];
-      x = parent[x];
-    }
-    return x;
-  };
-  auto unite = [&](int x, int y) {
-    const int rx = find(x);
-    const int ry = find(y);
-    if (rx != ry)
-      parent[rx] = ry;
-  };
-
-  enum EventKind { kEnd = 0, kStart = 1 };
-  struct Event {
-    int pos;
-    EventKind kind;
-    int idx;
-  };
-
-  std::vector<Event> events;
-  events.reserve(n * 2);
-  for (int idx = 0; idx < n; ++idx) {
-    const Block &b = output_blocks[idx];
-    events.push_back({b.r_start(), kStart, idx});
-    events.push_back({b.r_end() + 1, kEnd, idx});
-  }
-  // End events sort before start events at the same position so a block that
-  // ends exactly where another begins is not counted as overlapping.
-  std::sort(events.begin(), events.end(), [](const Event &x, const Event &y) {
-    if (x.pos != y.pos)
-      return x.pos < y.pos;
-    return x.kind < y.kind;
-  });
-
-  IntervalTree active;
-  std::vector<IntervalEntry> hits; // reused across the sweep -- avoids one
-                                    // heap allocation per kStart event
-  for (const auto &e : events) {
-    const Block &b = output_blocks[e.idx];
-    if (e.kind == kStart) {
-      hits.clear();
-      active.query(b.c_start(), b.c_end() + 1, hits);
-      for (const auto &hit : hits)
-        unite(e.idx, hit.data);
-      active.insert(b.c_start(), b.c_end() + 1, e.idx);
-    } else {
-      active.remove(b.c_start(), b.c_end() + 1, e.idx);
-    }
-  }
-
-  std::vector<Group> groups;
-  std::unordered_map<int, std::size_t> group_index;
-  for (int i = 0; i < n; ++i) {
-    const int root = find(i);
-    auto it = group_index.find(root);
-    if (it == group_index.end()) {
-      group_index.emplace(root, groups.size());
-      groups.push_back(Group{root, {i}});
-    } else {
-      groups[it->second].members.push_back(i);
-    }
-  }
-  return groups;
-}
-
-std::vector<Group>
-merge_overlapping_output_blocks_panels(const std::vector<Block> &output_blocks) {
   const int n = static_cast<int>(output_blocks.size());
 
   // Row-panel output_blocks directly (their row range IS their contributing

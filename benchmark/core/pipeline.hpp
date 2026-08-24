@@ -43,23 +43,14 @@ struct Group {
 
 // Sweep-line over `output_blocks` combined with inline union-find: finds
 // every spatially overlapping pair and immediately merges the two blocks
-// into the same component.  Returns one Group per connected component.
-// This replaces the two-step find_overlapping_output_blocks + merge_groups
-// pipeline with a single O(n log n) pass that never materialises the pairs.
+// into the same connected component. Returns one Group per component.
+// An output block's row range is always exactly its contributing A-block's
+// row range (see intersect() in block.cpp), so two output blocks with
+// disjoint row ranges can never end up in the same component regardless of
+// column overlap -- this partitions output_blocks into row-disjoint panels
+// first (same sweep as SpMM's row_groups), then runs one independent sweep +
+// union-find per panel in parallel via OpenMP.
 std::vector<Group> merge_overlapping_output_blocks(
-    const std::vector<Block>& output_blocks);
-
-// Same result as merge_overlapping_output_blocks (same partition into
-// connected components -- Group.id values may differ, but which blocks end
-// up in the same group does not), computed differently: an output block's
-// row range is always exactly its contributing A-block's row range (see
-// intersect() in block.cpp), so two output blocks with disjoint row ranges
-// can never end up in the same connected component regardless of column
-// overlap. This partitions output_blocks into row-disjoint panels first
-// (same sweep as SpMM's row_groups), then runs one independent sweep +
-// union-find per panel in parallel via OpenMP -- the global version's sweep
-// is a single sequential O(n log n) pass with no parallelism available.
-std::vector<Group> merge_overlapping_output_blocks_panels(
     const std::vector<Block>& output_blocks);
 
 // Kept for API compatibility; prefer merge_overlapping_output_blocks.

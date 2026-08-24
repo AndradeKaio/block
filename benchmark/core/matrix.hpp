@@ -32,6 +32,16 @@ struct scalar_traits<double> {
     static constexpr DataType dtype = DataType::F64;
 };
 
+// Compressed sparse row: row_ptr has length M+1 (row r's entries occupy
+// [row_ptr[r], row_ptr[r+1]) in col_idx/values), col_idx is sorted within
+// each row. Produced by Matrix<T>::to_csr().
+template <typename T>
+struct CSR {
+    std::vector<int> row_ptr;
+    std::vector<int> col_idx;
+    std::vector<T> values;
+};
+
 // An owning, block-sparse matrix: block geometry (`blocks`) plus a single
 // flat, homogeneous-dtype value buffer (`values`) holding every block's
 // cells concatenated in `blocks` order, row-major within each block.
@@ -73,6 +83,13 @@ struct Matrix {
     // (e.g. one of `blocks`, after assign_offsets()).
     std::span<T> block_data(const Block& b);
     std::span<const T> block_data(const Block& b) const;
+
+    // Flattens the block-sparse representation into a CSR matrix. Cells
+    // holding an exact-zero value are skipped (not just "imperfection"
+    // cells) -- matches the existing Python _load_bsp_as_csr's np.nonzero()
+    // behavior, so this is directly comparable to a scipy CSR built from the
+    // same .bsp file.
+    CSR<T> to_csr() const;
 };
 
 // Random matrix generator mirroring shared.py's `generate_matrices`

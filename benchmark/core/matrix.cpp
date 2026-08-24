@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <random>
+#include <tuple>
 
 #include "block_generator.hpp"
 
@@ -71,6 +72,43 @@ std::span<T> Matrix<T>::block_data(const Block& b) {
 template <typename T>
 std::span<const T> Matrix<T>::block_data(const Block& b) const {
     return std::span<const T>(values + b.offset, static_cast<std::size_t>(b.num_cells()));
+}
+
+template <typename T>
+CSR<T> Matrix<T>::to_csr() const {
+    // (row, col, value) for every cell whose stored value is a genuine
+    // nonzero -- blocks can overlap in row range (two different blocks
+    // covering the same rows at different columns), so entries can't be
+    // read off in row order just by walking `blocks`; collect then sort.
+    std::vector<std::tuple<int, int, T>> entries;
+    for (const Block& b : blocks) {
+        for (int ri = 0; ri < b.h; ++ri) {
+            for (int ci = 0; ci < b.w; ++ci) {
+                const T v = values[b.offset + static_cast<long long>(ri) * b.w + ci];
+                if (v != T(0)) {
+                    entries.emplace_back(b.r + ri, b.c + ci, v);
+                }
+            }
+        }
+    }
+    std::sort(entries.begin(), entries.end(), [](const auto& x, const auto& y) {
+        return std::tie(std::get<0>(x), std::get<1>(x)) < std::tie(std::get<0>(y), std::get<1>(y));
+    });
+
+    CSR<T> csr;
+    csr.row_ptr.assign(static_cast<std::size_t>(M) + 1, 0);
+    csr.col_idx.resize(entries.size());
+    csr.values.resize(entries.size());
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        const auto& [r, c, v] = entries[i];
+        ++csr.row_ptr[static_cast<std::size_t>(r) + 1];
+        csr.col_idx[i] = c;
+        csr.values[i] = v;
+    }
+    for (int r = 0; r < M; ++r) {
+        csr.row_ptr[static_cast<std::size_t>(r) + 1] += csr.row_ptr[static_cast<std::size_t>(r)];
+    }
+    return csr;
 }
 
 template <typename T>
