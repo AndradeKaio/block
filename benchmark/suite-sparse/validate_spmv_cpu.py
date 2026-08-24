@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
 """
-suite-sparse/validate_spmm_cpu.py — Correctness validation for CPU SpMM
+suite-sparse/validate_spmv_cpu.py — Correctness validation for CPU SpMV
 contenders (TACO + Prisma CPU).
 
 For each matrix, every contender is run with --seed S and --dump-c to write its
-output C matrix.  prisma_cpu additionally dumps D via --dump-d.  The scipy
-reference C_ref = S @ D is computed in Python and compared against each binary's
+output y vector.  prisma_cpu additionally dumps x via --dump-x.  The scipy
+reference y_ref = S @ x is computed in Python and compared against each binary's
 output.  Since all contenders share the same seed and the same mt19937_64 RNG,
-they produce identical D, so all C outputs can also be cross-compared directly.
-
-GPU contenders (prisma_gpu_cuda_*, cusparse_*) are validated separately by
-validate_spmm_gpu.py — kept apart so this script only needs the CPU/TACO
-toolchain (g++), mirroring the benchmark_spmm_cpu.py / benchmark_spmm_gpu.py
-split.
+they produce identical x, so all y outputs can also be cross-compared directly.
 
 Usage:
-  python validate_spmm_cpu.py MATRICES.csv
-  python validate_spmm_cpu.py MATRICES.csv --bin-dir ../SpMM/ --no-compile
-  python validate_spmm_cpu.py MATRICES.csv --kernels prisma_tiled,prisma_static
+  python validate_spmv_cpu.py MATRICES.csv
+  python validate_spmv_cpu.py MATRICES.csv --bin-dir ../SpMV/CPU/ --no-compile
+  python validate_spmv_cpu.py MATRICES.csv --kernels prisma_cpu,prisma_static
 """
 
 import argparse
@@ -40,31 +35,34 @@ except ImportError:
     _HAVE_H5PY = False
 
 # ---------------------------------------------------------------------------
-# Paths (mirrors benchmark_spmm_cpu.py)
+# Paths (mirrors benchmark_spmv_cpu.py)
 # ---------------------------------------------------------------------------
 
 _SCRIPT_DIR = Path(__file__).parent
-_SPMM_DIR   = _SCRIPT_DIR.parent / "SpMM"
+_SPMV_DIR   = _SCRIPT_DIR.parent / "SpMV" / "CPU"
 _DATA_ROOT  = Path("/home/kaio/datasets/suite-sparse")
 
 # ---------------------------------------------------------------------------
-# Contenders — CPU only
+# Contenders — CPU only. One shared binary per stem (no per-matrix
+# specialization, unlike SpMM's Prisma contender -- see
+# prisma_cpu_spmv_bench.cpp / benchmark_spmv_cpu.py for why).
 # ---------------------------------------------------------------------------
 
 # (label, binary_stem, input_ext, extra_flags)
+# prisma_specialized has no fixed stem -- it's compiled per-matrix (own top-N
+# shapes, exact-match dispatch, mirroring SpGEMM's prisma_top10), handled as
+# a special case in validate_matrix() below rather than a fixed bin_dir/stem
+# lookup.
 CONTENDERS = [
-    ("taco",               "bench_taco_spmm_taco",      ".mtx", []),
-    ("taco_opt0",          "bench_taco_spmm_taco_opt0", ".mtx", []),
-    ("taco_opt1",          "bench_taco_spmm_taco_opt1", ".mtx", []),
-    ("prisma_cpu",         "prisma_cpu_spmm_bench",     ".bsp", []),
-    ("prisma_specialized", "prisma_cpu_spmm_bench",     ".bsp", ["--specialized-kernels"]),
-    ("prisma_static",      "prisma_cpu_spmm_bench",     ".bsp", ["--specialized-kernels", "--static"]),
-    ("prisma_tiled",       "prisma_cpu_spmm_bench",     ".bsp", ["--specialized-kernels", "--tile-n", "512"]),
-    ("prisma_auto",        "prisma_cpu_spmm_bench",     ".bsp", ["--specialized-kernels", "--auto"]),
+    ("taco",               "bench_taco_spmv_taco",     ".mtx", []),
+    ("taco_opt",           "bench_taco_spmv_taco_opt", ".mtx", []),
+    ("prisma_cpu",         "prisma_cpu_spmv_bench",    ".bsp", []),
+    ("prisma_static",      "prisma_cpu_spmv_bench",    ".bsp", ["--static"]),
+    ("prisma_specialized", "",                         ".bsp", ["--specialized-kernels"]),
 ]
 
 # ---------------------------------------------------------------------------
-# Matrix location (same as benchmark_spmm_cpu.py)
+# Matrix location (same as benchmark_spmv_cpu.py)
 # ---------------------------------------------------------------------------
 
 
@@ -95,7 +93,7 @@ def load_matrix_list(csv_path: Path) -> list[dict]:
     return rows
 
 # ---------------------------------------------------------------------------
-# Compilation (delegates to benchmark_spmm_cpu.py helpers)
+# Compilation (delegates to benchmark_spmv_cpu.py helpers)
 # ---------------------------------------------------------------------------
 
 
@@ -104,7 +102,7 @@ def _load_bsp_as_csr(bsp: Path) -> scipy.sparse.csr_matrix | None:
 
     Values are read at whatever precision is stored in the file (float32 or
     float64) and upcast to float64.  This matches exactly what
-    read_matrix_binsparse<double> does inside prisma_cpu_spmm_bench.
+    read_matrix_binsparse<double> does inside prisma_cpu_spmv_bench.
     """
     if not _HAVE_H5PY:
         return None
@@ -139,33 +137,17 @@ def _load_bsp_as_csr(bsp: Path) -> scipy.sparse.csr_matrix | None:
     return scipy.sparse.csr_matrix((all_d, (all_r, all_c)), shape=(M, N), dtype=np.float64)
 
 
-def compile_all(bin_dir: Path, matrices: list[dict]) -> None:
+def compile_all(bin_dir: Path) -> None:
     sys.path.insert(0, str(_SCRIPT_DIR))
-    from benchmark_spmm_cpu import compile_binary, compile_prisma_per_matrix, _KERNELS
+    from benchmark_spmv_cpu import compile_binary, compile_prisma_cpu_spmv, _KERNELS
     print("Compiling TACO kernels:")
     for k, d in _KERNELS:
         compile_binary(bin_dir, k, d)
     print()
-    print("Compiling Prisma CPU SpMM (per-matrix kernels):")
-    compile_prisma_per_matrix(bin_dir, matrices)
+    print("Compiling Prisma CPU SpMV:")
+    compile_prisma_cpu_spmv(bin_dir)
     print()
 
-
-def _prisma_binary_path(bin_dir: Path, name: str, label: str = "prisma_cpu",
-                        stem: str = "") -> Path:
-    """Resolve a contender's binary path for one matrix.
-
-    Two binary-layout families:
-      1. Prisma CPU (label startswith "prisma") -- per-matrix specialized,
-         under --bin-dir. See compile_prisma_per_matrix in
-         benchmark_spmm_cpu.py.
-      2. Pooled TACO binaries (`stem` used as-is, no per-matrix compilation)
-         -- live under --bin-dir (CPU toolchain, see benchmark_spmm_cpu.py's
-         compile_binary).
-    """
-    if label.startswith("prisma"):
-        return bin_dir / f"prisma_cpu_spmm_bench_{name}"
-    return bin_dir / stem
 
 # ---------------------------------------------------------------------------
 # Core validation logic
@@ -192,29 +174,6 @@ def _compare(C: np.ndarray, C_ref: np.ndarray,
     )
 
 
-# Kept here (rather than dropped) because validate_spmm_gpu.py imports these
-# generic comparison helpers from this module -- prisma_gpu_cuda_fp64's tf32
-# tensor-core path needs a global-scale (not per-cell) tolerance; no CPU
-# contender needs it, but this stays the shared home for both validators'
-# comparison utilities.
-_TC_RTOL = 1e-2
-_TC_ATOL = 1e-6
-
-
-def _compare_global_scale(C: np.ndarray, C_ref: np.ndarray,
-                          rtol: float, atol: float) -> tuple[bool, float, float, int]:
-    diff = np.abs(C - C_ref)
-    global_scale = float(np.nanmax(np.abs(C_ref))) if C_ref.size else 0.0
-    scale = atol + rtol * global_scale
-    mask = diff > scale
-    return (
-        not mask.any(),
-        float(diff.max()),
-        float((diff / (np.abs(C_ref) + 1e-300)).max()),
-        int(mask.sum()),
-    )
-
-
 def validate_matrix(row: dict, mtx: Path, bin_dir: Path,
                     active: list, seed: int, rtol: float, atol: float,
                     timeout: int, tmp: Path) -> bool:
@@ -222,35 +181,15 @@ def validate_matrix(row: dict, mtx: Path, bin_dir: Path,
     bsp  = mtx.with_suffix(".bsp")
 
     S_mtx = scipy.io.mmread(str(mtx)).tocsr().astype(np.float64)
-    M, N  = S_mtx.shape
+    M, N  = S_mtx.shape  # M and N need not be equal -- x has length N, y has length M
 
     # Load S from BSP so Prisma reference uses the same precision as the binary.
-    # Existing BSPs may store float32 values; read_matrix_binsparse<double> does
-    # an HDF5 float32→float64 upcast (no extra loss), so _load_bsp_as_csr matches.
     S_bsp = _load_bsp_as_csr(bsp) if bsp.exists() else None
 
     all_pass = True
 
     # --- S_bsp vs S_mtx: are they the SAME matrix? --------------------------
-    # This is checked directly, independent of D and of any compute kernel,
-    # because it has exactly one correct answer (mod. float32 storage
-    # truncation) — unlike the C-output cross-checks below, which legitimately
-    # need a looser tolerance since Prisma and TACO are handed different-
-    # precision S by design. Comparing S directly here, rather than only
-    # inferring it from downstream C differences, is what actually catches
-    # a corrupted .bsp (e.g. mine_matrix.cpp's is_symmetric/is_pattern
-    # false-positive from scanning free-text comment lines, not just the MTX
-    # banner) instead of that corruption hiding behind a "different domain,
-    # expect some gap" cross-check tolerance loose enough to swallow it too.
     if S_bsp is not None:
-        # A numeric diff (not a structural/position-set comparison) is used
-        # deliberately: _load_bsp_as_csr drops stored zeros within a block
-        # via np.nonzero() (matching read_matrix_binsparse<double>'s own
-        # semantics -- a block CAN legitimately store an explicit zero at a
-        # real, non-implicit position), so S_bsp.nnz and S_mtx.nnz can differ
-        # even for a fully correct .bsp. Diffing values directly sidesteps
-        # that: a dropped explicit zero still comes out as 0 - 0 = 0 here,
-        # not a spurious mismatch.
         S_diff = np.abs((S_bsp - S_mtx).toarray())
         S_scale = 1e-6 + 1e-5 * np.abs(S_mtx.toarray())
         S_mask = S_diff > S_scale
@@ -268,42 +207,41 @@ def validate_matrix(row: dict, mtx: Path, bin_dir: Path,
                   f"{S_bsp.nnz} vs {S_mtx.nnz} -- a difference here alone is not "
                   f"a failure signal, see comment above)")
 
-    # --- Get D from prisma_cpu (same RNG as all Prisma variants) -----------
-    # TACO also uses mt19937_64 with the same seed after the .cpp rename.
-    d_path  = tmp / f"{name}_D.bin"
-    cp_path = tmp / f"{name}_C_prisma_cpu.bin"
-    D       = None
+    # --- Get x from prisma_cpu (same RNG as all Prisma variants) -----------
+    # TACO also uses mt19937_64 with the same seed.
+    x_path  = tmp / f"{name}_x.bin"
+    cp_path = tmp / f"{name}_y_prisma_cpu.bin"
+    x       = None
 
-    prisma_bin = _prisma_binary_path(bin_dir, name)
+    prisma_bin = bin_dir / "prisma_cpu_spmv_bench"
     have_bsp   = bsp.exists() and prisma_bin.exists()
     if have_bsp:
         cmd = [str(prisma_bin), str(bsp), "--runs", "1", "--seed", str(seed),
-               "--dump-d", str(d_path), "--dump-c", str(cp_path)]
+               "--dump-x", str(x_path), "--dump-y", str(cp_path)]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        if r.returncode == 0 and d_path.exists():
-            raw = np.fromfile(str(d_path), dtype=np.float64)
-            if raw.size == N * N:
-                D = raw.reshape(N, N)
+        if r.returncode == 0 and x_path.exists():
+            raw = np.fromfile(str(x_path), dtype=np.float64)
+            if raw.size == N:
+                x = raw
             else:
                 # A malformed dump (wrong size, e.g. truncated or empty) is
                 # treated the same as "no dump produced" -- everything
-                # downstream that depends on D degrades to "no reference"
-                # instead of crashing the whole validation run (this used to
-                # be an unguarded .reshape() -- one matrix producing a
-                # bad/short dump took out every remaining matrix in the
-                # batch with an uncaught ValueError).
-                print(f"  [D dump               ] WARNING: expected {N*N} "
+                # downstream that depends on x degrades to "no reference"
+                # instead of crashing the whole validation run on a later
+                # S_bsp @ x dimension-mismatch (see validate_spmm_cpu.py's
+                # identical guard -- same failure class hit there first).
+                print(f"  [x dump               ] WARNING: expected {N} "
                       f"elements, got {raw.size} -- treating as no reference "
                       f"for this matrix")
 
     # Two references depending on which S precision the contender uses:
-    #   C_ref_bsp — for Prisma variants (S from BSP, same float precision as binary)
-    #   C_ref_mtx — for TACO variants (S from MTX, full float64)
-    C_ref_bsp = (S_bsp @ D) if (D is not None and S_bsp is not None) else None
-    C_ref_mtx = (S_mtx @ D) if D is not None else None
+    #   y_ref_bsp — for Prisma variants (S from BSP, same float precision as binary)
+    #   y_ref_mtx — for TACO variants (S from MTX, full float64)
+    y_ref_bsp = (S_bsp @ x) if (x is not None and S_bsp is not None) else None
+    y_ref_mtx = (S_mtx @ x) if x is not None else None
 
     results: dict[str, np.ndarray] = {}
-    label_ext: dict[str, str] = {}  # for _domain()'s ext-based classification
+    label_ext: dict[str, str] = {}
 
     for label, stem, ext, extra_flags in active:
         if ext == ".bsp":
@@ -314,14 +252,25 @@ def validate_matrix(row: dict, mtx: Path, bin_dir: Path,
         else:
             inp = mtx
 
-        binary = _prisma_binary_path(bin_dir, name, label, stem)
-        if not binary.exists():
-            print(f"  [{label:<22}] SKIP (binary not found)")
-            continue
+        if label == "prisma_specialized":
+            from benchmark_spmv_cpu import compile_prisma_spmv_for_matrix
+            _, binary, msg = compile_prisma_spmv_for_matrix(bin_dir, bin_dir, name, bsp)
+            if binary is None:
+                print(f"  [{label:<22}] SKIP ({msg})")
+                continue
+        else:
+            binary = bin_dir / stem
+            if not binary.exists():
+                print(f"  [{label:<22}] SKIP (binary not found)")
+                continue
 
-        ck_path = tmp / f"{name}_C_{label}.bin"
+        ck_path = tmp / f"{name}_y_{label}.bin"
+        # TACO's binary keeps the original --dump-c flag name (output
+        # dump); Prisma's uses --dump-y (see prisma_cpu_spmv_bench.cpp's
+        # deliberate --dump-d/--dump-c -> --dump-x/--dump-y rename).
+        dump_flag = "--dump-c" if ext == ".mtx" else "--dump-y"
         cmd = ([str(binary), str(inp), "--runs", "1", "--seed", str(seed),
-                "--dump-c", str(ck_path)] + extra_flags)
+                dump_flag, str(ck_path)] + extra_flags)
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -338,42 +287,34 @@ def validate_matrix(row: dict, mtx: Path, bin_dir: Path,
             all_pass = False
             continue
 
-        raw = np.fromfile(str(ck_path), dtype=np.float64)
-        if raw.size != M * N:
-            print(f"  [{label:<22}] FAIL  output has {raw.size} elements, "
-                  f"expected {M}x{N}={M * N} (likely a .bsp/.mtx shape "
-                  f"mismatch — mismatched companion file, not a compute bug)")
+        y = np.fromfile(str(ck_path), dtype=np.float64)
+        if y.size != M:
+            print(f"  [{label:<22}] FAIL  output has {y.size} elements, "
+                  f"expected M={M} (likely a .bsp/.mtx shape mismatch — "
+                  f"mismatched companion file, not a compute bug)")
             all_pass = False
             continue
-        C = raw.reshape(M, N)
-        results[label] = C
+        results[label] = y
         label_ext[label] = ext
 
         # Choose reference by which INPUT FORMAT the contender reads, not
         # by label naming: .bsp readers (Prisma) get the truncated-
-        # precision-matching C_ref_bsp; .mtx readers (TACO) get the
-        # full-float64 C_ref_mtx.
-        C_ref = C_ref_bsp if ext == ".bsp" else C_ref_mtx
-        if C_ref is not None:
-            ok, max_err, max_rel, failures = _compare(C, C_ref, rtol, atol)
+        # precision-matching y_ref_bsp; .mtx readers (TACO) get the
+        # full-float64 y_ref_mtx.
+        y_ref = y_ref_bsp if ext == ".bsp" else y_ref_mtx
+        if y_ref is not None:
+            ok, max_err, max_rel, failures = _compare(y, y_ref, rtol, atol)
             if ok:
                 print(f"  [{label:<22}] PASS")
             else:
                 print(f"  [{label:<22}] FAIL  "
                       f"max_err={max_err:.3g}  max_rel={max_rel:.3g}  "
-                      f"failures={failures}/{C.size}")
+                      f"failures={failures}/{y.size}")
                 all_pass = False
         else:
             print(f"  [{label:<22}] (no reference — output captured)")
 
     # --- Cross-compare all captured outputs --------------------------------
-    # S storage precision is the only real precision axis left once GPU
-    # contenders are out of scope: Prisma reads S from .bsp (float32-stored
-    # values, upcast to double); TACO reads S from .mtx (native float64).
-    # Verified: bsp values are bit-exact float32 truncations of the mtx
-    # values, so a pair differing on this axis needs a relaxed tolerance;
-    # only a same-ext pair shares its reference's precision exactly and
-    # keeps the caller's strict tolerance, gating all_pass.
     _F32_CROSS_RTOL = 1e-4
     _F32_CROSS_ATOL = 1e-6
 
@@ -410,14 +351,14 @@ def validate_matrix(row: dict, mtx: Path, bin_dir: Path,
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="SpMM CPU correctness validation (TACO + Prisma CPU vs scipy reference)",
+        description="SpMV CPU correctness validation (TACO + Prisma CPU vs scipy reference)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     p.add_argument("csv", metavar="MATRICES.csv", nargs="?", default=None,
                    help="input CSV with at least a 'name' column")
     p.add_argument("--bin-dir", default="", dest="bin_dir",
-                   help="directory with compiled binaries (default: ../SpMM/)")
+                   help="directory with compiled binaries (default: ../SpMV/CPU/)")
     p.add_argument("--no-compile", action="store_true",
                    help="skip compilation; binaries must already exist")
     p.add_argument("--no-taco", action="store_true",
@@ -430,12 +371,11 @@ def parse_args():
                    help="RNG seed passed to all binaries (default 42)")
     p.add_argument("--rtol", type=float, default=1e-6,
                    help="relative tolerance for comparisons (default 1e-6). "
-                        "1e-10 (the old default) is tighter than double-precision "
-                        "reduction can guarantee once the summation order differs "
-                        "(scipy's serial reference vs. any parallel/blocked GEMM); "
-                        "observed order-of-summation noise on this suite tops out "
-                        "around 1e-7 relative, so 1e-6 leaves comfortable margin "
-                        "while still catching real bugs (which show as >1e-2).")
+                        "1e-10 is tighter than double-precision reduction can "
+                        "guarantee once the summation order differs (scipy's "
+                        "serial reference vs. any parallel/blocked kernel); "
+                        "1e-6 leaves comfortable margin while still catching "
+                        "real bugs (which show as >1e-2).")
     p.add_argument("--atol", type=float, default=1e-6,
                    help="absolute tolerance for comparisons (default 1e-6, see --rtol)")
     p.add_argument("--timeout", type=int, default=300,
@@ -457,7 +397,7 @@ _DEFAULT_MATRICES = [
 def main() -> None:
     args = parse_args()
 
-    bin_dir = Path(args.bin_dir) if args.bin_dir else _SPMM_DIR
+    bin_dir = Path(args.bin_dir) if args.bin_dir else _SPMV_DIR
 
     # Select active contenders
     if args.kernels:
@@ -482,7 +422,7 @@ def main() -> None:
     # Compile if needed
     if not args.no_compile:
         try:
-            compile_all(bin_dir, matrices)
+            compile_all(bin_dir)
         except Exception as e:
             sys.exit(f"Compilation failed: {e}")
 
@@ -494,7 +434,7 @@ def main() -> None:
 
     n_pass = n_fail = n_skip = 0
 
-    with tempfile.TemporaryDirectory(prefix="validate_spmm_cpu_") as tmp_str:
+    with tempfile.TemporaryDirectory(prefix="validate_spmv_cpu_") as tmp_str:
         tmp = Path(tmp_str)
         for i, row in enumerate(matrices, 1):
             name  = row["name"]
@@ -518,16 +458,10 @@ def main() -> None:
             else:
                 n_fail += 1
 
-            # Dumps are dense M×N doubles -- for a matrix in the tens of
-            # thousands of rows that's multiple GB per contender, and tmp is
-            # shared across the WHOLE matrix list (one TemporaryDirectory for
-            # the entire run, not per-matrix), so leaving them until the run
-            # finishes lets large matrices exhaust /tmp (often a RAM-backed
-            # tmpfs with a fraction-of-RAM cap) partway through a long list,
-            # producing exactly the truncated/empty-dump symptoms a full
-            # disk causes (fwrite() silently returns a short count on ENOSPC
-            # and nothing here was checking it). Delete this matrix's dumps
-            # now that it's done instead of waiting for the run to end.
+            # tmp is shared across the whole matrix list -- see
+            # validate_spmm_cpu.py's identical fix for the full rationale
+            # (dumps here are dense M/N-length vectors, smaller than SpMM's
+            # dense matrices, but still unbounded over a long matrix list).
             for f in tmp.glob(f"{name}_*"):
                 try:
                     f.unlink()

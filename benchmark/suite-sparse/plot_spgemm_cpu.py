@@ -87,6 +87,12 @@ def parse_args():
         default="",
         help="Text appended to the plot title",
     )
+    p.add_argument(
+        "--show-min",
+        action="store_true",
+        default=False,
+        help="Plot the minimum time per run instead of the mean",
+    )
     return p.parse_args()
 
 
@@ -137,7 +143,8 @@ def _fmt_nnz(v):
 
 def _add_panel(fig: go.Figure, stats: pd.DataFrame, matrix_order: list,
               nnz_map: dict, kernels_ordered: list, col: int,
-              show_legend: bool) -> None:
+              show_legend: bool, show_min: bool = False) -> None:
+    value_col = "min_ms" if show_min else "mean_ms"
     for kernel in kernels_ordered:
         kdf = stats[stats["kernel"] == kernel].set_index("matrix_name")
         if kdf.empty:
@@ -145,15 +152,18 @@ def _add_panel(fig: go.Figure, stats: pd.DataFrame, matrix_order: list,
         color = KERNEL_COLORS.get(kernel, DEFAULT_COLOR)
         display_name = KERNEL_DISPLAY.get(kernel, kernel)
 
-        means = [
-            kdf.loc[m, "mean_ms"] if m in kdf.index else None for m in matrix_order
+        values = [
+            kdf.loc[m, value_col] if m in kdf.index else None for m in matrix_order
         ]
+        # Error bars always span [min_ms, max_ms] regardless of which value is
+        # plotted -- when show_min is set, the plotted point sits at the
+        # bottom of the bar (lower=0) instead of the middle.
         lowers = [
-            kdf.loc[m, "mean_ms"] - kdf.loc[m, "min_ms"] if m in kdf.index else None
+            kdf.loc[m, value_col] - kdf.loc[m, "min_ms"] if m in kdf.index else None
             for m in matrix_order
         ]
         uppers = [
-            kdf.loc[m, "max_ms"] - kdf.loc[m, "mean_ms"] if m in kdf.index else None
+            kdf.loc[m, "max_ms"] - kdf.loc[m, value_col] if m in kdf.index else None
             for m in matrix_order
         ]
         hover = [
@@ -178,7 +188,7 @@ def _add_panel(fig: go.Figure, stats: pd.DataFrame, matrix_order: list,
                 showlegend=show_legend,
                 mode="markers",
                 x=list(range(len(matrix_order))),
-                y=means,
+                y=values,
                 error_y=dict(
                     type="data",
                     symmetric=False,
@@ -198,7 +208,7 @@ def _add_panel(fig: go.Figure, stats: pd.DataFrame, matrix_order: list,
 
 
 def make_figure(stats_total: pd.DataFrame, stats_compute: pd.DataFrame,
-                note: str = "") -> go.Figure:
+                note: str = "", show_min: bool = False) -> go.Figure:
     # Both panels share the same matrix set/order — build it once from
     # whichever stats frame is non-empty (normally both are, over the same
     # CSV) so the two subplots stay x-aligned for direct comparison.
@@ -246,7 +256,7 @@ def make_figure(stats_total: pd.DataFrame, stats_compute: pd.DataFrame,
             show = kernel not in legend_shown
             legend_shown.add(kernel)
             _add_panel(fig, stats[stats["kernel"] == kernel], matrix_order,
-                      nnz_map, [kernel], col, show_legend=show)
+                      nnz_map, [kernel], col, show_legend=show, show_min=show_min)
 
     fig.update_xaxes(
         tickmode="array", tickvals=tick_vals, ticktext=tick_labels,
@@ -256,14 +266,16 @@ def make_figure(stats_total: pd.DataFrame, stats_compute: pd.DataFrame,
         tickmode="array", tickvals=tick_vals, ticktext=tick_labels,
         title="NNZ (ordered ascending)", gridcolor="#e0e0e0", row=1, col=2,
     )
-    fig.update_yaxes(title="Mean time [ms]", gridcolor="#e0e0e0", type="log",
+    y_axis_label = "Min time [ms]" if show_min else "Mean time [ms]"
+    fig.update_yaxes(title=y_axis_label, gridcolor="#e0e0e0", type="log",
                      row=1, col=1)
-    fig.update_yaxes(title="Mean time [ms]", gridcolor="#e0e0e0", type="log",
+    fig.update_yaxes(title=y_axis_label, gridcolor="#e0e0e0", type="log",
                      row=1, col=2)
 
     fig.update_layout(
         title=dict(
             text="SuiteSparse CPU SpGEMM benchmark"
+            + (" (min)" if show_min else "")
             + (f" — {note}" if note else ""),
             font=dict(size=17),
             x=0.5,
@@ -338,7 +350,7 @@ def main():
     _report_missing(df, "compute_ms")
     print()
 
-    fig = make_figure(stats_total, stats_compute, note=args.note)
+    fig = make_figure(stats_total, stats_compute, note=args.note, show_min=args.show_min)
 
     if args.out:
         fig.write_html(args.out, include_plotlyjs="cdn")

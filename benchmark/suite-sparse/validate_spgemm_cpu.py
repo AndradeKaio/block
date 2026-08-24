@@ -11,7 +11,7 @@ and compared against a scipy reference.
 Both contenders are full double precision now: taco_cpu/taco_cpu_opt
 (bench_taco.c's Bv/Cv/A_t->vals are all `double`) and prisma_generic/
 prisma_top10 (prisma_cpu_bench.cpp's Scalar -- was float, switched to
-double; see that file's comment and gen_spgemm_kernels.py's matching
+double; see that file's comment and core/gen_kernel.py's matching
 _pd-intrinsics rewrite). mine_matrix.cpp also writes .bsp values as
 double (Matrix<double> -> write_matrix_binsparse<double>, see
 core/matrix_io.cpp), so there's no meaningful precision gap left between
@@ -135,12 +135,18 @@ def _compare(C: np.ndarray, C_ref: np.ndarray,
     diff  = np.abs(C - C_ref)
     scale = atol + rtol * np.abs(C_ref)
     mask  = diff > scale
-    return (
-        not mask.any(),
-        float(diff.max()),
-        float((diff / (np.abs(C_ref) + 1e-300)).max()),
-        int(mask.sum()),
-    )
+    # max_err/max_rel are restricted to FAILING cells only -- unmasked
+    # diff.max() also picks up passing cells where both C and C_ref are
+    # legitimately huge (e.g. A@A of a matrix with large-magnitude entries)
+    # and agree within tolerance, which reports a misleadingly enormous
+    # "error" for a cell that isn't actually wrong.
+    if mask.any():
+        max_err = float(diff[mask].max())
+        max_rel = float((diff[mask] / (np.abs(C_ref[mask]) + 1e-300)).max())
+    else:
+        max_err = 0.0
+        max_rel = 0.0
+    return (not mask.any(), max_err, max_rel, int(mask.sum()))
 
 
 def _top_failures(C: np.ndarray, C_ref: np.ndarray, rtol: float, atol: float,
@@ -170,7 +176,6 @@ def validate_matrix(
     taco_bin: Path | None, taco_opt_bin: Path | None, prisma_bin: Path | None,
     active: list, top_n: int, blas: bool, rtol: float, atol: float,
     timeout: int, tmp: Path, work_dir: Path, mtx_cache: Path,
-    merge_strategy: str = "sequential",
 ) -> bool:
     name = row["name"]
     bsp  = mtx.with_suffix(".bsp")
@@ -194,6 +199,18 @@ def validate_matrix(
     if bsp.exists():
         S_bsp = _load_bsp_as_csr(bsp)
         if S_bsp is not None:
+            # NOTE: S_bsp.nnz and S_mtx.nnz are NOT directly comparable and a
+            # raw mismatch is not itself a failure -- _load_bsp_as_csr uses
+            # np.nonzero() per block, filtering exact-0.0 values, while
+            # scipy.io.mmread(...).tocsr() (no .eliminate_zeros() call) keeps
+            # any explicitly-stored-zero entries from the .mtx file as-is.  A
+            # matrix with real explicit-zero entries in its .mtx will show
+            # bsp_nnz < mtx_nnz here even though mining lost nothing -- see
+            # mining/validate_bsp.py's fast check (sum(h*w-imps) vs raw file
+            # nnz) for the actual structural-completeness comparison; this
+            # block only checks VALUES, via the tolerance comparison below,
+            # which is unaffected by the explicit-zero representational gap
+            # (0.0 vs 0.0 is always within tolerance).
             S_diff = np.abs((S_bsp - S_mtx).toarray())
             S_scale = atol + rtol * np.abs(S_mtx.toarray())
             S_mask = S_diff > S_scale
@@ -260,8 +277,7 @@ def validate_matrix(
                 label = "prisma_generic"
                 print(f"  [{label:<22}] ", end="", flush=True)
                 vf = tmp / f"{name}_C_{label}.coo"
-                cmd = [str(prisma_bin), str(bsp), str(bsp), "--runs", "1", "--validate", str(vf),
-                       "--merge-strategy", merge_strategy]
+                cmd = [str(prisma_bin), str(bsp), str(bsp), "--runs", "1", "--validate", str(vf)]
                 try:
                     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
                 except subprocess.TimeoutExpired:
@@ -284,6 +300,8 @@ def validate_matrix(
                         else:
                             print(f"FAIL  max_err={max_err:.3g}  max_rel={max_rel:.3g}  "
                                   f"failures={failures}/{C.size}")
+                            for r, c, got, ref in _top_failures(C, C_ref_bsp, rtol, atol):
+                                print(f"    ({r},{c}): got={got:.6g}  ref={ref:.6g}")
                             all_pass = False
 
             if "prisma_top10" in active:
@@ -303,8 +321,7 @@ def validate_matrix(
                         )
                         vf = tmp / f"{name}_C_{label}.coo"
                         cmd = [str(top10_bin), str(bsp), str(bsp), "--runs", "1",
-                               "--specialized-kernels", "--validate", str(vf),
-                               "--merge-strategy", merge_strategy]
+                               "--specialized-kernels", "--validate", str(vf)]
                         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
                         if r.returncode != 0:
                             print(f"FAILED (exit {r.returncode})")
@@ -321,6 +338,8 @@ def validate_matrix(
                             else:
                                 print(f"FAIL  max_err={max_err:.3g}  max_rel={max_rel:.3g}  "
                                       f"failures={failures}/{C.size}")
+                                for r, c, got, ref in _top_failures(C, C_ref_bsp, rtol, atol):
+                                    print(f"    ({r},{c}): got={got:.6g}  ref={ref:.6g}")
                                 all_pass = False
                 except (RuntimeError, subprocess.TimeoutExpired, FileNotFoundError) as e:
                     print(f"FAILED ({e})")
@@ -393,13 +412,6 @@ def parse_args():
                    help="absolute tolerance (default 1e-6, see --rtol)")
     p.add_argument("--timeout", type=int, default=300,
                    help="per-contender timeout in seconds (default 300)")
-    p.add_argument("--merge-strategy", default="sequential", dest="merge_strategy",
-                   choices=["sequential", "panels"],
-                   help="prisma_cpu_bench's merge_overlapping_output_blocks "
-                        "implementation to validate: 'sequential' (default, "
-                        "single global sweep) or 'panels' (row-panel decomposition, "
-                        "parallel via OpenMP -- see core/pipeline.hpp, provably same "
-                        "grouping as 'sequential')")
     return p.parse_args()
 
 
@@ -465,7 +477,6 @@ def main() -> None:
     print(f"Matrices : {len(matrices)}")
     print(f"Kernels  : {active}")
     print(f"Tolerances: rtol={args.rtol}  atol={args.atol}")
-    print(f"Merge strategy: {args.merge_strategy}")
     print()
 
     n_pass = n_fail = n_skip = 0
@@ -488,7 +499,6 @@ def main() -> None:
             ok = validate_matrix(
                 row, mtx, taco_bin, taco_opt_bin, prisma_bin, active, args.top_n, args.blas,
                 args.rtol, args.atol, args.timeout, tmp, bin_dir, mtx_cache,
-                merge_strategy=args.merge_strategy,
             )
             elapsed = time.time() - t0
             print(f"  ({elapsed:.1f}s)")
@@ -496,6 +506,18 @@ def main() -> None:
                 n_pass += 1
             else:
                 n_fail += 1
+
+            # tmp is shared across the whole matrix list (one
+            # TemporaryDirectory for the entire run), so dumps accumulate
+            # unless cleaned up per-matrix -- see validate_spmm_cpu.py's
+            # identical fix for the full rationale (this format is COO text,
+            # not dense, so the risk is lower here, but still unbounded over
+            # a long matrix list).
+            for f in tmp.glob(f"{name}_*"):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
 
     print()
     print(f"Summary: {n_pass} PASS  {n_fail} FAIL  {n_skip} SKIP")

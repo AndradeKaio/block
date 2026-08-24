@@ -61,6 +61,8 @@ def parse_args():
                    help="Save HTML to this path (also opens in browser if omitted)")
     p.add_argument("--show", action="store_true", default=False,
                    help="Open in browser even when --out is given")
+    p.add_argument("--show-min", action="store_true", default=False,
+                   help="Plot the minimum time per run instead of the mean")
     return p.parse_args()
 
 
@@ -117,7 +119,8 @@ def _fmt_nnz(v):
 
 def _add_panel(fig: go.Figure, stats: pd.DataFrame, matrix_order: list,
               nnz_map: dict, kernels_ordered: list, col: int,
-              show_legend: bool) -> None:
+              show_legend: bool, show_min: bool = False) -> None:
+    value_col = "min_ms" if show_min else "mean_ms"
     for kernel in kernels_ordered:
         kdf = stats[stats["kernel"] == kernel].set_index("matrix_name")
         if kdf.empty:
@@ -125,13 +128,13 @@ def _add_panel(fig: go.Figure, stats: pd.DataFrame, matrix_order: list,
         color        = KERNEL_COLORS.get(kernel, DEFAULT_COLOR)
         display_name = KERNEL_DISPLAY.get(kernel, kernel)
 
-        means  = [kdf.loc[m, "mean_ms"] if m in kdf.index else None for m in matrix_order]
+        values = [kdf.loc[m, value_col] if m in kdf.index else None for m in matrix_order]
         lowers = [
-            kdf.loc[m, "mean_ms"] - kdf.loc[m, "min_ms"] if m in kdf.index else None
+            kdf.loc[m, value_col] - kdf.loc[m, "min_ms"] if m in kdf.index else None
             for m in matrix_order
         ]
         uppers = [
-            kdf.loc[m, "max_ms"] - kdf.loc[m, "mean_ms"] if m in kdf.index else None
+            kdf.loc[m, "max_ms"] - kdf.loc[m, value_col] if m in kdf.index else None
             for m in matrix_order
         ]
         hover = [
@@ -153,7 +156,7 @@ def _add_panel(fig: go.Figure, stats: pd.DataFrame, matrix_order: list,
             showlegend=show_legend,
             mode="markers",
             x=list(range(len(matrix_order))),
-            y=means,
+            y=values,
             error_y=dict(
                 type="data",
                 symmetric=False,
@@ -170,7 +173,8 @@ def _add_panel(fig: go.Figure, stats: pd.DataFrame, matrix_order: list,
         ), row=1, col=col)
 
 
-def make_figure(stats_total: pd.DataFrame, stats_compute: pd.DataFrame) -> go.Figure:
+def make_figure(stats_total: pd.DataFrame, stats_compute: pd.DataFrame,
+                show_min: bool = False) -> go.Figure:
     basis = stats_total if not stats_total.empty else stats_compute
     matrix_order = (
         basis[["matrix_name", "nnz"]]
@@ -213,7 +217,7 @@ def make_figure(stats_total: pd.DataFrame, stats_compute: pd.DataFrame) -> go.Fi
             show = kernel not in legend_shown
             legend_shown.add(kernel)
             _add_panel(fig, stats[stats["kernel"] == kernel], matrix_order,
-                      nnz_map, [kernel], col, show_legend=show)
+                      nnz_map, [kernel], col, show_legend=show, show_min=show_min)
 
     fig.update_xaxes(
         tickmode="array", tickvals=tick_vals, ticktext=tick_labels,
@@ -223,14 +227,16 @@ def make_figure(stats_total: pd.DataFrame, stats_compute: pd.DataFrame) -> go.Fi
         tickmode="array", tickvals=tick_vals, ticktext=tick_labels,
         title="NNZ (ordered ascending)", gridcolor="#e0e0e0", row=1, col=2,
     )
-    fig.update_yaxes(title="Mean time [ms]", gridcolor="#e0e0e0", type="log",
+    y_axis_label = "Min time [ms]" if show_min else "Mean time [ms]"
+    fig.update_yaxes(title=y_axis_label, gridcolor="#e0e0e0", type="log",
                      row=1, col=1)
-    fig.update_yaxes(title="Mean time [ms]", gridcolor="#e0e0e0", type="log",
+    fig.update_yaxes(title=y_axis_label, gridcolor="#e0e0e0", type="log",
                      row=1, col=2)
 
     fig.update_layout(
         title=dict(
-            text="SuiteSparse GPU SpMM benchmark",
+            text="SuiteSparse GPU SpMM benchmark"
+            + (" (min)" if show_min else ""),
             font=dict(size=17),
             x=0.5,
         ),
@@ -303,7 +309,7 @@ def main():
     _report_missing(df, "compute_ms")
     print()
 
-    fig = make_figure(stats_total, stats_compute)
+    fig = make_figure(stats_total, stats_compute, show_min=args.show_min)
 
     if args.out:
         fig.write_html(args.out, include_plotlyjs="cdn")

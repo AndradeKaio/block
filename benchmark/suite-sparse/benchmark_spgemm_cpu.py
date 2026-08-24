@@ -7,10 +7,6 @@ Computes C = A × A (square self-product) and compares:
   taco_cpu_opt   — TACO-generated SpGEMM kernel (parallelized + reordered)
   prisma_generic      — Prisma, gemm_fallback (#pragma omp simd, auto-vectorised)
   prisma_top10        — Prisma, per-matrix compiled with top-N (M,K,N) dispatch table
-  prisma_top10_panels — same binary as prisma_top10, but with --merge-strategy panels:
-                        merge_overlapping_output_blocks_panels, a row-panel-parallel
-                        (OpenMP) implementation instead of the default single global
-                        sweep -- see core/pipeline.hpp; provably the same grouping
 
 The symbolic pipeline (TACO's assemble(); Prisma's intersect pairs → merge groups
 → block fusion → plan build) is redone from scratch on every timed run, not run
@@ -46,7 +42,7 @@ from pathlib import Path
 _SCRIPT_DIR = Path(__file__).parent
 _CPU_DIR = _SCRIPT_DIR.parent / "SpGEMM" / "CPU"
 _CORE_DIR = _SCRIPT_DIR.parent / "core"
-_GEN_SPGEMM_KERNELS = _SCRIPT_DIR.parent / "SpGEMM" / "gen_spgemm_kernels.py"
+_GEN_KERNEL = _SCRIPT_DIR.parent / "core" / "gen_kernel.py"
 # Shared compile output dir for every SpGEMM kernel (CPU/GPU, benchmark/
 # validate) -- same /tmp/_prismac/ root SpMM uses, nested under spgemm/ so
 # the two don't collide, and reused across runs instead of a fresh mkdtemp
@@ -333,7 +329,6 @@ def run_prisma_spgemm(
     timeout: int,
     specialized: bool = False,
     extra_sym_ms: float = 0.0,
-    merge_strategy: str = "sequential",
 ) -> tuple[list[tuple[float, float, float]], int, int]:
     """Run prisma_cpu_bench with A=B=bsp (A×A) and return timing triples.
 
@@ -351,15 +346,10 @@ def run_prisma_spgemm(
     symbolic cost above, that setup truly happens once regardless of n_timed,
     so it alone is amortised (divided by n_timed) on top of each run's real
     symbolic measurement.
-
-    merge_strategy selects prisma_cpu_bench's merge_overlapping_output_blocks
-    implementation ("sequential" (default) or "panels", see core/pipeline.hpp)
-    -- both provably produce the same grouping, this only affects symbolic_ms.
     """
     if not bsp.exists():
         raise FileNotFoundError(f"BSP not found: {bsp}")
-    cmd = [str(binary), str(bsp), str(bsp), "--runs", str(runs),
-           "--merge-strategy", merge_strategy]
+    cmd = [str(binary), str(bsp), str(bsp), "--runs", str(runs)]
     if specialized:
         cmd.append("--specialized-kernels")
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -425,7 +415,8 @@ def analyze_spgemm_shapes(
 def gen_spgemm_kernels_files(
     shapes: list[tuple[int, int, int]], out_dir: Path
 ) -> tuple[Path, Path]:
-    """Call gen_spgemm_kernels.py to produce named-register SIMD specializations.
+    """Call the shared core/gen_kernel.py to produce named-register SIMD
+    specializations for SpGEMM's mined (M,K,N) shapes.
 
     Returns (kernels_hpp, dispatch_hpp) paths written inside out_dir.
     """
@@ -433,7 +424,7 @@ def gen_spgemm_kernels_files(
     shapes_arg = ",".join(f"{m}x{k}x{n}" for m, k, n in shapes)
     cmd = [
         sys.executable,
-        str(_GEN_SPGEMM_KERNELS),
+        str(_GEN_KERNEL),
         "--shapes",
         shapes_arg,
         "--out-dir",
@@ -442,11 +433,11 @@ def gen_spgemm_kernels_files(
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(
-            f"gen_spgemm_kernels.py failed:\n{r.stderr[-1000:]}\n{r.stdout[-500:]}"
+            f"gen_kernel.py failed:\n{r.stderr[-1000:]}\n{r.stdout[-500:]}"
         )
     return (
-        out_dir / "spgemm_kernels_generated.hpp",
-        out_dir / "spgemm_dispatch_generated.hpp",
+        out_dir / "kernels_generated.hpp",
+        out_dir / "dispatch_generated.hpp",
     )
 
 
@@ -466,7 +457,7 @@ def compile_prisma_spgemm_per_matrix(
         "-fopenmp",
         "-march=native",
         "-DHAVE_HDF5",
-        f'-DSPGEMM_DISPATCH_H="{dispatch_hpp.resolve()}"',
+        f'-DGEMM_DISPATCH_H="{dispatch_hpp.resolve()}"',
         f"-I{_CORE_DIR}",
         f"-I{_CPU_DIR}",
         f"-I{_HDF5_INC}",
@@ -478,7 +469,7 @@ def compile_prisma_spgemm_per_matrix(
     if kernels_hpp is not None:
         cmd.insert(
             cmd.index("-DHAVE_HDF5") + 1,
-            f'-DSPGEMM_KERNELS_H="{kernels_hpp.resolve()}"',
+            f'-DGEMM_KERNELS_H="{kernels_hpp.resolve()}"',
         )
     if blas:
         cmd[-1:-1] = ["-DHAVE_BLAS", "-lblas"]
@@ -537,7 +528,6 @@ def benchmark_matrix(
     f_csv,
     run_generic: bool = True,
     run_top10: bool = True,
-    run_top10_panels: bool = True,
     top_n: int = 10,
     blas: bool = False,
     work_dir: Path | None = None,
@@ -583,12 +573,11 @@ def benchmark_matrix(
 
     def _run_prisma(
         label: str, binary: Path, specialized: bool, extra_sym_ms: float = 0.0,
-        merge_strategy: str = "sequential",
     ) -> None:
         print(f"  [{label:<28}] ", end="", flush=True)
         try:
             triples, n_pairs, n_groups = run_prisma_spgemm(
-                binary, bsp, runs, timeout, specialized, extra_sym_ms, merge_strategy
+                binary, bsp, runs, timeout, specialized, extra_sym_ms
             )
         except (RuntimeError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             print(f"FAILED ({e})")
@@ -632,25 +621,11 @@ def benchmark_matrix(
                     top10_bin,
                     specialized=True,
                     extra_sym_ms=shapes_sym_ms,
-                    merge_strategy="sequential",
                 )
-                if run_top10_panels:
-                    # Same compiled binary, same shapes analysis -- only the
-                    # runtime --merge-strategy flag differs, so no need to
-                    # recompile or re-run analyze_spgemm_shapes.
-                    _run_prisma(
-                        "prisma_top10_panels",
-                        top10_bin,
-                        specialized=True,
-                        extra_sym_ms=shapes_sym_ms,
-                        merge_strategy="panels",
-                    )
         except (RuntimeError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             print(f"FAILED ({e})")
             for run_id in range(runs + 1):
                 _emit(writer, f_csv, base, "prisma_top10", run_id, _NAN, _NAN, _NAN)
-                if run_top10_panels:
-                    _emit(writer, f_csv, base, "prisma_top10_panels", run_id, _NAN, _NAN, _NAN)
 
 
 # ---------------------------------------------------------------------------
@@ -749,14 +724,6 @@ def parse_args():
         action="store_true",
         dest="no_top10",
         help="skip prisma_top10 per-matrix specialized kernel",
-    )
-    g.add_argument(
-        "--no-top10-panels",
-        action="store_true",
-        dest="no_top10_panels",
-        help="skip prisma_top10_panels (same specialized kernel as prisma_top10, "
-             "but with --merge-strategy panels -- the row-panel-parallel "
-             "merge_overlapping_output_blocks, see core/pipeline.hpp)",
     )
     g.add_argument(
         "--top-n",
@@ -896,7 +863,6 @@ def main() -> None:
                     f_csv=f_csv,
                     run_generic=not args.no_generic and not args.no_prisma,
                     run_top10=not args.no_top10 and not args.no_prisma,
-                    run_top10_panels=not args.no_top10_panels and not args.no_prisma,
                     top_n=args.top_n,
                     blas=args.blas,
                     work_dir=work_dir,
