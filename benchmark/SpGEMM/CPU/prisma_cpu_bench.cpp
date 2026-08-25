@@ -14,6 +14,10 @@
 #include <tuple>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace {
 
 // double, matching TACO's own bench_taco.c (Bv/Cv/A_t->vals are all
@@ -31,12 +35,15 @@ struct Args {
   bool specialized = false;
   int print_shapes = 0;
   bool histogram = false;
+  int threads = 0; // 0 = auto (see main(): capped default unless
+                    // OMP_NUM_THREADS is set); >0 = explicit override
 };
 
 void print_usage(const char *prog) {
   std::fprintf(stderr,
                "Usage: %s <A.bsp> <B.bsp> [--runs N] [--validate FILE] "
-               "[--specialized-kernels] [--print-shapes N] [--histogram]\n",
+               "[--specialized-kernels] [--print-shapes N] [--histogram] "
+               "[--threads N]\n",
                prog);
 }
 
@@ -67,6 +74,8 @@ Args parse_args(int argc, char **argv) {
       args.print_shapes = std::atoi(next());
     else if (arg == "--histogram")
       args.histogram = true;
+    else if (arg == "--threads")
+      args.threads = std::atoi(next());
     else if (arg == "--help" || arg == "-h") {
       print_usage(argv[0]);
       std::exit(0);
@@ -98,6 +107,19 @@ void print_arr(const std::vector<double> &v) {
 
 int main(int argc, char **argv) {
   const Args args = parse_args(argc, argv);
+
+#ifdef _OPENMP
+  // Thread count: same measured cap as prisma_cpu_spmm_bench.cpp /
+  // prisma_cpu_spmv_bench.cpp (see those files for the full profiling
+  // rationale -- oversubscription past ~16 threads measured up to ~15x
+  // slower on the reference machine). Set before any OpenMP region runs,
+  // including the symbolic pipeline below.
+  if (args.threads > 0) {
+    omp_set_num_threads(args.threads);
+  } else if (!std::getenv("OMP_NUM_THREADS")) {
+    omp_set_num_threads(std::min(16, omp_get_max_threads()));
+  }
+#endif
 
   for (const auto &path : {args.a_bsp, args.b_bsp}) {
     FILE *f = std::fopen(path.c_str(), "rb");

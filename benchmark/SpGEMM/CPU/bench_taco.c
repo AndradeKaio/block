@@ -152,10 +152,17 @@ int main(int argc, char *argv[]) {
       reset_out(A_t);
     long t0 = ns_now();
     assemble(A_t, B_t, C_t);
+    A_nnz = ((int *)A_t->indices[1][0])[M];
+    /* Zero-filling the freshly (re)allocated output buffer belongs to
+       assemble()'s "get the structure ready" symbolic work, not compute()'s
+       numerical work -- matches prisma_cpu_bench.cpp's cpu_plan_build,
+       which zero-fills its own output buffer for the same reason. Counted
+       here, inside sym, instead of in the (previously unmeasured) gap
+       before t1: that gap was silently hiding this cost from both
+       assemble_ns and compute_ns. */
+    memset(A_t->vals, 0, (size_t)A_nnz * sizeof(double));
     long sym = ns_now() - t0;
     sym_total += sym;
-    A_nnz = ((int *)A_t->indices[1][0])[M];
-    memset(A_t->vals, 0, (size_t)A_nnz * sizeof(double));
     long t1 = ns_now();
     compute(A_t, B_t, C_t);
     long c = ns_now() - t1;

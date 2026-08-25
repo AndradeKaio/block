@@ -195,7 +195,34 @@ CpuPlan<T> cpu_plan_build(const FusionResult &fusion, const Matrix<T> &A,
   C.N = B.N;
   C.blocks = fusion.fused_blocks;
   C.n_values = static_cast<std::size_t>(assign_offsets(C.blocks));
-  C.values = new T[C.n_values]();
+  // No value-init here (no trailing `()`) -- the parallel zero-fill below
+  // is the sole write. Before this, the value-init AND that fill both
+  // wrote zero into every element: the same buffer, twice, every run.
+  C.values = new T[C.n_values];
+#ifdef _OPENMP
+  // Zero-fill in parallel rather than one thread eating the whole
+  // cold-page cost serially. C.values is dense output storage, large
+  // enough that first-touch page faults on a freshly (or re-)allocated
+  // buffer can dominate this call -- splitting the range across threads
+  // lets the kernel service those faults concurrently instead of one at a
+  // time. Deliberately counted here, inside plan_build/symbolic (matching
+  // TACO's assemble(), which allocates its own output storage the same
+  // way) rather than in cpu_compute -- allocating and zero-preparing the
+  // output belongs to "get the structure ready", not to the numerical
+  // multiply-add work that follows.
+#pragma omp parallel
+  {
+    const int nt = omp_get_num_threads();
+    const int tid = omp_get_thread_num();
+    const std::size_t chunk = (C.n_values + nt - 1) / nt;
+    const std::size_t start = std::min(chunk * (std::size_t)tid, C.n_values);
+    const std::size_t end = std::min(start + chunk, C.n_values);
+    if (end > start)
+      std::memset(C.values + start, 0, (end - start) * sizeof(T));
+  }
+#else
+  std::memset(C.values, 0, C.n_values * sizeof(T));
+#endif
 
   const int n = static_cast<int>(fusion.fused_blocks.size());
   plan.fi_offsets.resize(n + 1, 0);
@@ -235,9 +262,9 @@ CpuPlan<T> cpu_plan_build(const FusionResult &fusion, const Matrix<T> &A,
 template <typename T, bool Specialized> double cpu_compute(CpuPlan<T> &plan) {
   Matrix<T> &C = plan.C;
 
-  std::memset(C.values, 0, C.n_values * sizeof(T));
-
   using Clock = std::chrono::steady_clock;
+  // C.values arrives already zeroed -- cpu_plan_build does the fill (see
+  // its comment for why that's now counted as symbolic, not compute).
   const auto t0 = Clock::now();
 
   const int n = static_cast<int>(plan.fi_offsets.size()) - 1;
