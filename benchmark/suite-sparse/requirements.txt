@@ -1,0 +1,8 @@
+numpy==2.5.2
+pandas==3.0.5
+scipy==1.18.1
+h5py==3.16.0
+plotly==7.0.0
+ssgetpy==1.0rc2
+pqdm==0.2.0
+tqdm==4.70.0

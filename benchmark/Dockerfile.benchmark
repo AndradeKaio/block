@@ -1,0 +1,60 @@
+# Build with (from the repo root, so core/, mining/, SpGEMM/, SpMM/, SpMV/,
+# and suite-sparse/ all land in the build context):
+#   docker build -f Dockerfile.benchmark -t sparse-bench .
+#
+# Run with (all three volumes recommended -- see docker-entrypoint.sh's
+# header comment for env vars):
+#   docker run --rm \
+#     -v $(pwd)/matrices.csv:/input/matrices.csv:ro \
+#     -v suite-sparse-cache:/home/kaio/datasets/suite-sparse \
+#     -v $(pwd)/results:/results \
+#     sparse-bench
+#
+# Deliberately single-stage, unlike mining/Dockerfile's slim multi-stage
+# build: every TACO/Prisma benchmark binary compiles with -march=native,
+# which must happen on the real target CPU at container-run time, not at
+# `docker build` time on some other machine -- so the full compiler
+# toolchain has to survive into the runtime image. Only mine_matrix (no
+# -march=native, confirmed portable) is actually built at image-build time.
+FROM python:3.12-slim-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libhdf5-dev pkg-config \
+    linux-perf time \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY suite-sparse/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+# Pre-fetch the SuiteSparse index so workers don't race on first run
+# (same trick as mining/Dockerfile).
+RUN python -c "import ssgetpy; ssgetpy.search(limit=1)" || true
+
+COPY core/ /app/core/
+COPY mining/ /app/mining/
+COPY SpGEMM/ /app/SpGEMM/
+COPY SpMM/ /app/SpMM/
+COPY SpMV/ /app/SpMV/
+COPY suite-sparse/ /app/suite-sparse/
+
+# mine_matrix has no -march=native -- safe to build now, portable across hosts.
+RUN g++ -O3 -std=c++20 -I/app/core /app/mining/mine_matrix.cpp \
+    /app/core/block.cpp /app/core/block_generator.cpp /app/core/block_mining.cpp \
+    /app/core/interval_tree.cpp /app/core/matrix.cpp /app/core/matrix_io.cpp \
+    /app/core/segment_tree.cpp -DHAVE_HDF5 \
+    $(pkg-config --cflags --libs hdf5-serial 2>/dev/null || pkg-config --cflags --libs hdf5) \
+    -o /usr/local/bin/mine_matrix
+
+# TACO/Prisma benchmark binaries are deliberately NOT built here -- the
+# benchmark scripts self-compile on every invocation (unless --no-compile
+# is passed), which is exactly what's needed for -march=native to target
+# the real host this container ends up running on.
+
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
+
+ENV WORKERS=4 RUNS=5 ENABLE_PERF=0 MATRICES_CSV=/input/matrices.csv
+
+VOLUME ["/home/kaio/datasets/suite-sparse", "/results"]
+WORKDIR /app/suite-sparse
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
