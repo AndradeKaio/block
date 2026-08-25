@@ -30,6 +30,8 @@ import sys
 import time
 from pathlib import Path
 
+import perf_wrap
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -51,12 +53,26 @@ _CSV_FIELDS = [
     "nnz",
     "kernel",
     "run_id",
+    "threads",
     "symbolic_ms",
     "compute_ms",
     "total_ms",
-]
+] + perf_wrap.PERF_CSV_FIELDS
 
 _NAN = float("nan")
+
+
+def _parse_thread_sweep(spec: str) -> list[int]:
+    """'32,16,8,4,2,1' -> that exact list; '32' -> halved down to 1
+    (32,16,8,4,2,1) since integer division naturally terminates at 1."""
+    if "," in spec:
+        return [int(x) for x in spec.split(",") if x.strip()]
+    n = int(spec)
+    vals = []
+    while n >= 1:
+        vals.append(n)
+        n //= 2
+    return vals
 
 
 def _fmt(v: float) -> str:
@@ -170,10 +186,15 @@ def _parse_json_block(stdout: str) -> dict:
 
 
 def run_spmm(
-    binary: Path, mtx: Path, runs: int, timeout: int
-) -> list[tuple[float, float, float]]:
-    """Run bench_taco_spmm and return [(symbolic_ms, compute_ms, total_ms)] for
-    run_id 0..runs (inclusive)."""
+    binary: Path, mtx: Path, runs: int, timeout: int, perf: bool = False
+) -> tuple[list[tuple[float, float, float]], dict]:
+    """Run bench_taco_spmm and return ([(symbolic_ms, compute_ms, total_ms)],
+    perf_metrics) for run_id 0..runs (inclusive).
+
+    perf_metrics is one aggregate perf-stat/RSS reading for the entire
+    process lifetime, from a second, separate invocation wrapped in
+    `perf stat` -- see perf_wrap.py. NaN in every field if perf=False or perf
+    itself failed (never affects the real timing/success of this run)."""
     cmd = [str(binary), str(mtx), "--runs", str(runs)]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
@@ -196,7 +217,8 @@ def run_spmm(
         sym = asm_ns.get(run_id, 0) / 1e6
         comp = comp_ns.get(run_id, 0) / 1e6
         result.append((sym, comp, sym + comp))
-    return result
+    perf_metrics = perf_wrap.measure(cmd, timeout) if perf else perf_wrap.empty_metrics()
+    return result, perf_metrics
 
 
 def benchmark_matrix(
@@ -208,6 +230,8 @@ def benchmark_matrix(
     timeout: int,
     writer,
     f_csv,
+    threads: int = 0,
+    perf: bool = False,
 ) -> None:
     base = {
         "matrix_name": row["name"],
@@ -215,10 +239,11 @@ def benchmark_matrix(
         "rows": row.get("rows", ""),
         "cols": row.get("cols", ""),
         "nnz": row.get("nnz", ""),
+        "threads": threads,
     }
     print(f"  [{kernel}] {row['name']} … ", end="", flush=True)
     try:
-        triples = run_spmm(binary, mtx, runs, timeout)
+        triples, perf_metrics = run_spmm(binary, mtx, runs, timeout, perf)
     except (RuntimeError, subprocess.TimeoutExpired) as e:
         print(f"FAILED ({e})")
         for run_id in range(runs + 1):
@@ -230,6 +255,7 @@ def benchmark_matrix(
                     "symbolic_ms": "nan",
                     "compute_ms": "nan",
                     "total_ms": "nan",
+                    **perf_wrap.empty_metrics(),
                 }
             )
         f_csv.flush()
@@ -244,6 +270,7 @@ def benchmark_matrix(
                 "symbolic_ms": _fmt(s),
                 "compute_ms": _fmt(c),
                 "total_ms": _fmt(t),
+                **perf_metrics,
             }
         )
     f_csv.flush()
@@ -696,19 +723,17 @@ def run_prisma_cpu_spmm(
     runs: int,
     timeout: int,
     specialized: bool = False,
-    use_static: bool = False,
     tile_n: int = 0,
-    auto_schedule: bool = False,
-) -> list[tuple[float, float, float]]:
+    threads: int = 0,
+    perf: bool = False,
+) -> tuple[list[tuple[float, float, float]], dict]:
     cmd = [str(binary), str(bsp), "--runs", str(runs)]
     if specialized:
         cmd.append("--specialized-kernels")
-    if use_static:
-        cmd.append("--static")
     if tile_n > 0:
         cmd.extend(["--tile-n", str(tile_n)])
-    if auto_schedule:
-        cmd.append("--auto")
+    if threads > 0:
+        cmd.extend(["--threads", str(threads)])
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
         raise RuntimeError(f"prisma_cpu_spmm exited {r.returncode}:\n{r.stderr[-800:]}")
@@ -726,7 +751,9 @@ def run_prisma_cpu_spmm(
     # (bench_taco_spmm.cpp) is redone every run the same way, folded into
     # run_%d_assemble_ns.
     symbolic_ms = d.get("symbolic_ms", [0.0] * len(compute_ms))
-    return [(sym, comp, sym + comp) for sym, comp in zip(symbolic_ms, compute_ms)]
+    triples = [(sym, comp, sym + comp) for sym, comp in zip(symbolic_ms, compute_ms)]
+    perf_metrics = perf_wrap.measure(cmd, timeout) if perf else perf_wrap.empty_metrics()
+    return triples, perf_metrics
 
 
 def benchmark_matrix_prisma(
@@ -739,9 +766,9 @@ def benchmark_matrix_prisma(
     f_csv,
     kernel: str = "prisma_cpu",
     specialized: bool = False,
-    use_static: bool = False,
     tile_n: int = 0,
-    auto_schedule: bool = False,
+    threads: int = 0,
+    perf: bool = False,
 ) -> None:
     bsp = mtx.with_suffix(".bsp")
     if not bsp.exists():
@@ -753,11 +780,12 @@ def benchmark_matrix_prisma(
         "rows": row.get("rows", ""),
         "cols": row.get("cols", ""),
         "nnz": row.get("nnz", ""),
+        "threads": threads,
     }
     print(f"  [{kernel}] {row['name']} … ", end="", flush=True)
     try:
-        triples = run_prisma_cpu_spmm(
-            binary, bsp, runs, timeout, specialized, use_static, tile_n, auto_schedule
+        triples, perf_metrics = run_prisma_cpu_spmm(
+            binary, bsp, runs, timeout, specialized, tile_n, threads, perf,
         )
     except (RuntimeError, subprocess.TimeoutExpired) as e:
         print(f"FAILED ({e})")
@@ -770,6 +798,7 @@ def benchmark_matrix_prisma(
                     "symbolic_ms": "nan",
                     "compute_ms": "nan",
                     "total_ms": "nan",
+                    **perf_wrap.empty_metrics(),
                 }
             )
         f_csv.flush()
@@ -784,6 +813,7 @@ def benchmark_matrix_prisma(
                 "symbolic_ms": _fmt(s),
                 "compute_ms": _fmt(c),
                 "total_ms": _fmt(t),
+                **perf_metrics,
             }
         )
     f_csv.flush()
@@ -818,6 +848,35 @@ def parse_args():
         type=int,
         default=300,
         help="per-matrix timeout in seconds (default: 300)",
+    )
+    g.add_argument(
+        "--threads",
+        type=int,
+        default=0,
+        dest="threads",
+        help="OpenMP threads for prisma_cpu_spmm_bench and OMP_NUM_THREADS "
+        "for TACO (default: 0, meaning min(16, all available cores) -- see "
+        "prisma_cpu_spmm_bench.cpp's own default-cap rationale). Ignored "
+        "if --threads-sweep is given.",
+    )
+    g.add_argument(
+        "--threads-sweep",
+        default=None,
+        dest="threads_sweep",
+        help="Sweep multiple thread counts instead of one fixed value. "
+        "Either a comma-separated list (e.g. '32,16,8,4,2,1') or a single "
+        "max value that gets auto-expanded by halving down to 1 (e.g. "
+        "'32' -> 32,16,8,4,2,1). The full matrix list is benchmarked once "
+        "per thread count, all appended to the same --out CSV, "
+        "distinguished by the 'threads' column.",
+    )
+    g.add_argument(
+        "--perf",
+        action="store_true",
+        help="Also collect hardware perf counters (cycles, instructions, "
+        "cache/branch/TLB misses) and peak RSS via `perf stat` + `time -v`, "
+        "one extra wrapped re-run per kernel call (needs perf_event_open "
+        "access; see perf_wrap.py). Roughly doubles wall time per call.",
     )
 
     g = p.add_argument_group("Paths")
@@ -890,24 +949,10 @@ def parse_args():
         help="skip the prisma_specialized kernel (keep prisma_cpu)",
     )
     g.add_argument(
-        "--no-prisma-static",
-        action="store_true",
-        dest="no_prisma_static",
-        help="skip the prisma_specialized_static kernel (schedule(static))",
-    )
-    g.add_argument(
         "--no-prisma-tiled",
         action="store_true",
         dest="no_prisma_tiled",
         help="skip the prisma_specialized_tiled kernel (column tiling)",
-    )
-    g.add_argument(
-        "--no-prisma-auto",
-        action="store_true",
-        dest="no_prisma_auto",
-        help="skip prisma_auto (the --auto runtime static-vs-tiled "
-        "selector — the practical, deployable default; the "
-        "other prisma_* kernels are fixed-strategy ablations)",
     )
     g.add_argument(
         "--tile-n",
@@ -1046,106 +1091,117 @@ def main() -> None:
     csv_path = Path(args.out)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Thread count(s) applied to BOTH contenders identically: TACO's
+    # binaries have no --threads flag of their own and only ever read
+    # OMP_NUM_THREADS from the environment, while prisma_cpu_spmm_bench
+    # gets it explicitly via --threads. Without this, TACO would run
+    # uncapped (all cores) by default while prisma defaults to
+    # min(16, nproc) internally -- given this codebase's own measured
+    # finding that oversubscription can be up to 15x slower, that asymmetry
+    # would bias every comparison in prisma's favor for reasons unrelated
+    # to either algorithm. Computed once so both contenders always see the
+    # exact same value, whether --threads was passed or not.
+    thread_values = (
+        _parse_thread_sweep(args.threads_sweep) if args.threads_sweep
+        else [args.threads if args.threads > 0 else min(16, os.cpu_count() or 16)]
+    )
+
     print(f"Output  : {csv_path}")
     print(f"Matrices: {len(matrices)}")
     print(f"Runs    : {args.runs}")
+    print(f"Threads : {thread_values}")
     print()
 
     write_header = _needs_header(csv_path)
     with open(csv_path, "a", newline="") as f_csv:
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        f_csv.write(f"# {ts}  input={args.csv}  runs={args.runs}\n")
         writer = csv.DictWriter(
             f_csv, fieldnames=_CSV_FIELDS, extrasaction="ignore", lineterminator="\n"
         )
         if write_header:
             writer.writeheader()
 
-        for i, row in enumerate(matrices, 1):
-            name = row["name"]
-            group = row.get("group", "")
-            print(f"[{i}/{len(matrices)}] {name}")
-
-            mtx = find_mtx(name, group)
-            if mtx is None:
-                print(f"  MTX not found — skipping")
-                continue
-
-            for binary, kernel in taco_binaries:
-                benchmark_matrix(
-                    row, mtx, binary, kernel, args.runs, args.timeout, writer, f_csv
-                )
-
-            active_prisma_binary = (
-                prisma_binary
-                if prisma_binary is not None
-                else prisma_binaries.get(name)
+        # prisma_binaries is compiled once, upfront (above) -- independent
+        # of thread count, so sweeping threads here costs nothing extra in
+        # compile time, unlike SpGEMM's inline-per-matrix compile.
+        for threads in thread_values:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            f_csv.write(
+                f"# {ts}  input={args.csv}  runs={args.runs}  threads={threads}\n"
             )
-            if active_prisma_binary is None and not args.no_prisma:
-                print(f"  [prisma_*] no compiled binary for {name} — skipping")
-            if active_prisma_binary is not None:
-                benchmark_matrix_prisma(
-                    row,
-                    mtx,
-                    active_prisma_binary,
-                    args.runs,
-                    args.timeout,
-                    writer,
-                    f_csv,
-                    kernel="prisma_cpu",
-                    specialized=False,
-                )
-                if not args.no_prisma_specialized:
-                    benchmark_matrix_prisma(
-                        row,
-                        mtx,
-                        active_prisma_binary,
-                        args.runs,
-                        args.timeout,
-                        writer,
-                        f_csv,
-                        kernel="prisma_specialized",
-                        specialized=True,
+            env = {**os.environ, "OMP_NUM_THREADS": str(threads)}
+
+            old_env = os.environ.copy()
+            os.environ.update(env)
+            try:
+                for i, row in enumerate(matrices, 1):
+                    name = row["name"]
+                    group = row.get("group", "")
+                    print(f"[threads={threads}] [{i}/{len(matrices)}] {name}")
+
+                    mtx = find_mtx(name, group)
+                    if mtx is None:
+                        print(f"  MTX not found — skipping")
+                        continue
+
+                    for binary, kernel in taco_binaries:
+                        benchmark_matrix(
+                            row, mtx, binary, kernel, args.runs, args.timeout,
+                            writer, f_csv, threads=threads, perf=args.perf,
+                        )
+
+                    active_prisma_binary = (
+                        prisma_binary
+                        if prisma_binary is not None
+                        else prisma_binaries.get(name)
                     )
-                if not args.no_prisma_static:
-                    benchmark_matrix_prisma(
-                        row,
-                        mtx,
-                        active_prisma_binary,
-                        args.runs,
-                        args.timeout,
-                        writer,
-                        f_csv,
-                        kernel="prisma_static",
-                        specialized=True,
-                        use_static=True,
-                    )
-                if not args.no_prisma_tiled:
-                    benchmark_matrix_prisma(
-                        row,
-                        mtx,
-                        active_prisma_binary,
-                        args.runs,
-                        args.timeout,
-                        writer,
-                        f_csv,
-                        kernel="prisma_tiled",
-                        specialized=True,
-                        tile_n=args.tile_n,
-                    )
-                if not args.no_prisma_auto:
-                    benchmark_matrix_prisma(
-                        row,
-                        mtx,
-                        active_prisma_binary,
-                        args.runs,
-                        args.timeout,
-                        writer,
-                        f_csv,
-                        kernel="prisma_auto",
-                        specialized=True,
-                        auto_schedule=True,
-                    )
+                    if active_prisma_binary is None and not args.no_prisma:
+                        print(f"  [prisma_*] no compiled binary for {name} — skipping")
+                    if active_prisma_binary is not None:
+                        benchmark_matrix_prisma(
+                            row,
+                            mtx,
+                            active_prisma_binary,
+                            args.runs,
+                            args.timeout,
+                            writer,
+                            f_csv,
+                            kernel="prisma_cpu",
+                            specialized=False,
+                            threads=threads,
+                            perf=args.perf,
+                        )
+                        if not args.no_prisma_specialized:
+                            benchmark_matrix_prisma(
+                                row,
+                                mtx,
+                                active_prisma_binary,
+                                args.runs,
+                                args.timeout,
+                                writer,
+                                f_csv,
+                                kernel="prisma_specialized",
+                                specialized=True,
+                                threads=threads,
+                                perf=args.perf,
+                            )
+                        if not args.no_prisma_tiled:
+                            benchmark_matrix_prisma(
+                                row,
+                                mtx,
+                                active_prisma_binary,
+                                args.runs,
+                                args.timeout,
+                                writer,
+                                f_csv,
+                                kernel="prisma_tiled",
+                                specialized=True,
+                                tile_n=args.tile_n,
+                                threads=threads,
+                                perf=args.perf,
+                            )
+            finally:
+                os.environ.clear()
+                os.environ.update(old_env)
     print(f"\nDone. Results in {csv_path}")
 
 

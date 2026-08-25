@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-plot_spmm.py — Plot suite-sparse SpMM benchmark results.
+plot_spmv_cpu.py — Plot suite-sparse SpMV benchmark results.
 
 Produces a 1x2 grid: total time on the left, compute time only on the
 right, sharing one legend.
@@ -10,8 +10,8 @@ Y-axis : mean time per run [ms], log scale
 Columns: one scatter point per contender per matrix
 
 Usage:
-  python plot_spmm.py --file spmm_results.csv
-  python plot_spmm.py --file results.csv --warmup --out plot.html
+  python plot_spmv_cpu.py --file spmv_results.csv
+  python plot_spmv_cpu.py --file results.csv --warmup --out plot.html
 """
 
 import argparse
@@ -29,26 +29,20 @@ from plotly.subplots import make_subplots
 KERNEL_COLORS = {
     # TACO variants → reds
     "taco":                "#d62728",
-    "taco_opt0":            "#fc9272",
-    "taco_opt1":            "#99000d",
+    "taco_opt":             "#99000d",
     # Prisma variants → greens
     "prisma_cpu":           "#41ab5d",
+    "prisma_static":        "#74c476",
     "prisma_specialized":   "#006d2c",
-    "prisma_tiled":         "#00441b",
 }
 
 KERNEL_DISPLAY = {
     "taco":                "TACO",
-    "taco_opt0":            "TACO opt0",
-    "taco_opt1":            "TACO opt1",
+    "taco_opt":             "TACO opt",
     "prisma_cpu":           "BLOCKS",
+    "prisma_static":        "BLOCKS (static sched)",
     "prisma_specialized":   "BLOCKS (specialized)",
-    "prisma_tiled":         "BLOCKS (specialized+tiled)",
 }
-
-# Fixed-strategy ablations (schedule(static) / --auto runtime picker) --
-# not interesting to plot alongside the deployable kernels above.
-DROPPED_KERNELS = {"prisma_auto", "prisma_static"}
 
 DEFAULT_COLOR = "#7f7f7f"
 
@@ -59,10 +53,10 @@ DEFAULT_COLOR = "#7f7f7f"
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Plot suite-sparse SpMM benchmark results.",
+        description="Plot suite-sparse SpMV benchmark results.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--file", required=True, help="Benchmark CSV produced by benchmark_spmm_cpu.py")
+    p.add_argument("--file", required=True, help="Benchmark CSV produced by benchmark_spmv_cpu.py")
     p.add_argument("--warmup", action="store_true", default=False,
                    help="Include warmup run (run_id == 0) in the average")
     p.add_argument("--out", default=None,
@@ -91,8 +85,6 @@ def load(path: str, include_warmup: bool) -> pd.DataFrame:
 
     if not include_warmup:
         df = df[df["run_id"] != 0]
-
-    df = df[~df["kernel"].isin(DROPPED_KERNELS)]
 
     return df
 
@@ -239,7 +231,7 @@ def make_figure(stats_total: pd.DataFrame, stats_compute: pd.DataFrame,
 
     fig.update_layout(
         title=dict(
-            text="SuiteSparse CPU SpMM benchmark"
+            text="SuiteSparse CPU SpMV benchmark"
             + (" (min)" if show_min else "")
             + (f" — {note}" if note else ""),
             font=dict(size=17),

@@ -37,10 +37,10 @@ import plotly.graph_objects as go
 # ---------------------------------------------------------------------------
 
 KERNEL_COLORS = {
-    # TACO variants → blues
-    "taco":                "#1f77b4",
-    "taco_opt0":            "#6baed6",
-    "taco_opt1":            "#08519c",
+    # TACO variants → reds
+    "taco":                "#d62728",
+    "taco_opt0":            "#fc9272",
+    "taco_opt1":            "#99000d",
     # Prisma variants → greens
     "prisma_cpu":           "#41ab5d",
     "prisma_auto":          "#a1d99b",
@@ -53,12 +53,17 @@ KERNEL_DISPLAY = {
     "taco":                "TACO",
     "taco_opt0":            "TACO opt0",
     "taco_opt1":            "TACO opt1",
-    "prisma_cpu":           "BLOCKS (CPU)",
+    "prisma_cpu":           "BLOCKS",
     "prisma_auto":          "BLOCKS (auto)",
     "prisma_specialized":   "BLOCKS (specialized)",
     "prisma_static":        "BLOCKS (static sched)",
-    "prisma_tiled":         "BLOCKS (tiled)",
+    "prisma_tiled":         "BLOCKS (specialized+tiled)",
 }
+
+# Fixed-strategy ablations, no longer produced by benchmark_spmm_cpu.py --
+# kept only so old CSVs from before that removal still load cleanly (see
+# plot_spmm_cpu.py's identical exclusion).
+DROPPED_KERNELS = {"prisma_auto", "prisma_static"}
 
 DEFAULT_COLOR  = "#7f7f7f"
 SYMBOLIC_COLOR = "#bdbdbd"  # one shared color for every kernel's symbolic segment
@@ -99,6 +104,8 @@ def load(path: str, include_warmup: bool) -> pd.DataFrame:
 
     if not include_warmup:
         df = df[df["run_id"] != 0]
+
+    df = df[~df["kernel"].isin(DROPPED_KERNELS)]
 
     return df
 

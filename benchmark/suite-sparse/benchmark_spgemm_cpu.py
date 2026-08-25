@@ -34,6 +34,8 @@ import sys
 import time
 from pathlib import Path
 
+import perf_wrap
+
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -61,14 +63,28 @@ _CSV_FIELDS = [
     "nnz",
     "kernel",
     "run_id",
+    "threads",
     "symbolic_ms",
     "compute_ms",
     "total_ms",
     "n_pairs",
     "n_groups",
-]
+] + perf_wrap.PERF_CSV_FIELDS
 
 _NAN = float("nan")
+
+
+def _parse_thread_sweep(spec: str) -> list[int]:
+    """'32,16,8,4,2,1' -> that exact list; '32' -> halved down to 1
+    (32,16,8,4,2,1) since integer division naturally terminates at 1."""
+    if "," in spec:
+        return [int(x) for x in spec.split(",") if x.strip()]
+    n = int(spec)
+    vals = []
+    while n >= 1:
+        vals.append(n)
+        n //= 2
+    return vals
 
 
 def _fmt(v: float) -> str:
@@ -286,8 +302,9 @@ def run_taco_cpu(
     mtx: Path,
     runs: int,
     timeout: int,
-) -> list[tuple[float, float, float]]:
-    """Run bench_taco (A×A) and return [(symbolic_ms, compute_ms, total_ms)].
+    perf: bool = False,
+) -> tuple[list[tuple[float, float, float]], dict]:
+    """Run bench_taco (A×A) and return ([(symbolic_ms, compute_ms, total_ms)], perf_metrics).
 
     Every run redoes TACO's assemble() from scratch (see bench_taco.c) instead
     of assembling once and reusing the pattern, so symbolic_ms below is a real
@@ -295,6 +312,12 @@ def run_taco_cpu(
     cost, not a single measurement divided by n_timed. Averaging N real
     measurements (which plot_spgemm_cpu.py's groupby(...).mean() already does)
     reflects that honestly.
+
+    perf_metrics is one aggregate perf-stat/RSS reading for the *entire*
+    process lifetime (all runs+1 iterations combined, plus startup), from a
+    second, separate invocation of the same command wrapped in `perf stat` --
+    see perf_wrap.py. NaN in every field if perf=False or perf itself failed
+    (never affects the real timing/success of this run).
     """
     cmd = [str(binary), str(mtx), str(mtx), str(runs + 1)]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -319,7 +342,9 @@ def run_taco_cpu(
         sym = asm_ns.get(run_id, 0) / 1e6
         comp = comp_ns.get(run_id, 0) / 1e6
         result.append((sym, comp, sym + comp))
-    return result
+
+    perf_metrics = perf_wrap.measure(cmd, timeout) if perf else perf_wrap.empty_metrics()
+    return result, perf_metrics
 
 
 def run_prisma_spgemm(
@@ -329,16 +354,18 @@ def run_prisma_spgemm(
     timeout: int,
     specialized: bool = False,
     extra_sym_ms: float = 0.0,
-) -> tuple[list[tuple[float, float, float]], int, int]:
+    perf: bool = False,
+    threads: int = 0,
+) -> tuple[list[tuple[float, float, float]], int, int, dict]:
     """Run prisma_cpu_bench with A=B=bsp (A×A) and return timing triples.
 
-    Returns (triples, n_pairs, n_groups).  triples is [(sym_ms, compute_ms,
-    total_ms)] for run_id 0..runs.  Every run redoes the full symbolic
-    pipeline (intersect -> merge -> fuse -> plan_build) from scratch inside
-    prisma_cpu_bench (see its main loop), so sym_ms is a real per-run
-    measurement, not one measurement divided by n_timed -- a cold, one-off
-    caller pays the full symbolic cost, and averaging N real measurements
-    reflects that honestly.
+    Returns (triples, n_pairs, n_groups, perf_metrics).  triples is
+    [(sym_ms, compute_ms, total_ms)] for run_id 0..runs.  Every run redoes the
+    full symbolic pipeline (intersect -> merge -> fuse -> plan_build) from
+    scratch inside prisma_cpu_bench (see its main loop), so sym_ms is a real
+    per-run measurement, not one measurement divided by n_timed -- a cold,
+    one-off caller pays the full symbolic cost, and averaging N real
+    measurements reflects that honestly.
 
     extra_sym_ms is a genuinely one-time cost from a prior --print-shapes
     invocation (only nonzero for prisma_top10, which must analyse shapes once
@@ -346,12 +373,20 @@ def run_prisma_spgemm(
     symbolic cost above, that setup truly happens once regardless of n_timed,
     so it alone is amortised (divided by n_timed) on top of each run's real
     symbolic measurement.
+
+    perf_metrics is one aggregate perf-stat/RSS reading for the entire
+    process lifetime (all runs, plus startup), from a second, separate
+    invocation of the same command wrapped in `perf stat` -- see
+    perf_wrap.py. NaN in every field if perf=False or perf itself failed
+    (never affects the real timing/success of this run).
     """
     if not bsp.exists():
         raise FileNotFoundError(f"BSP not found: {bsp}")
     cmd = [str(binary), str(bsp), str(bsp), "--runs", str(runs)]
     if specialized:
         cmd.append("--specialized-kernels")
+    if threads > 0:
+        cmd.extend(["--threads", str(threads)])
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
         raise RuntimeError(
@@ -380,7 +415,8 @@ def run_prisma_spgemm(
         comp = float(c)
         triples.append((sym, comp, sym + comp))
 
-    return triples, n_pairs, n_groups
+    perf_metrics = perf_wrap.measure(cmd, timeout) if perf else perf_wrap.empty_metrics()
+    return triples, n_pairs, n_groups, perf_metrics
 
 
 def analyze_spgemm_shapes(
@@ -500,6 +536,7 @@ def _emit(
     total: float,
     n_pairs: int | str = "",
     n_groups: int | str = "",
+    perf_metrics: dict | None = None,
 ) -> None:
     writer.writerow(
         {
@@ -511,6 +548,7 @@ def _emit(
             "total_ms": _fmt(total),
             "n_pairs": n_pairs,
             "n_groups": n_groups,
+            **(perf_metrics or perf_wrap.empty_metrics()),
         }
     )
     f_csv.flush()
@@ -532,6 +570,8 @@ def benchmark_matrix(
     blas: bool = False,
     work_dir: Path | None = None,
     mtx_cache: Path = Path("/tmp/mtx_cache"),
+    threads: int = 0,
+    perf: bool = False,
 ) -> None:
     name = row["name"]
     base = {
@@ -540,6 +580,7 @@ def benchmark_matrix(
         "rows": row.get("rows", ""),
         "cols": row.get("cols", ""),
         "nnz": row.get("nnz", ""),
+        "threads": threads,
     }
 
     # ── TACO (needs real-general MTX) ─────────────────────────────────────────
@@ -549,14 +590,14 @@ def benchmark_matrix(
         print(f"  [{label:<28}] ", end="", flush=True)
         try:
             taco_mtx = ensure_real_general(mtx, mtx_cache)
-            triples = run_taco_cpu(binary, taco_mtx, runs, timeout)
+            triples, perf_metrics = run_taco_cpu(binary, taco_mtx, runs, timeout, perf)
         except (RuntimeError, subprocess.TimeoutExpired, Exception) as e:
             print(f"FAILED ({e})")
             for run_id in range(runs + 1):
                 _emit(writer, f_csv, base, label, run_id, _NAN, _NAN, _NAN)
             continue
         for run_id, (s, c, t) in enumerate(triples):
-            _emit(writer, f_csv, base, label, run_id, s, c, t)
+            _emit(writer, f_csv, base, label, run_id, s, c, t, perf_metrics=perf_metrics)
         timed = [t for _, _, t in triples[1:]] or [t for _, _, t in triples]
         print(
             f"avg {sum(timed) / len(timed):.3f} ms  ({len(triples)} runs incl. warmup)"
@@ -576,8 +617,8 @@ def benchmark_matrix(
     ) -> None:
         print(f"  [{label:<28}] ", end="", flush=True)
         try:
-            triples, n_pairs, n_groups = run_prisma_spgemm(
-                binary, bsp, runs, timeout, specialized, extra_sym_ms
+            triples, n_pairs, n_groups, perf_metrics = run_prisma_spgemm(
+                binary, bsp, runs, timeout, specialized, extra_sym_ms, perf, threads
             )
         except (RuntimeError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             print(f"FAILED ({e})")
@@ -585,7 +626,10 @@ def benchmark_matrix(
                 _emit(writer, f_csv, base, label, run_id, _NAN, _NAN, _NAN)
             return
         for run_id, (s, c, t) in enumerate(triples):
-            _emit(writer, f_csv, base, label, run_id, s, c, t, n_pairs, n_groups)
+            _emit(
+                writer, f_csv, base, label, run_id, s, c, t,
+                n_pairs, n_groups, perf_metrics=perf_metrics,
+            )
         timed = [t for _, _, t in triples[1:]] or [t for _, _, t in triples]
         sym_timed = [s for s, _, _ in triples[1:]] or [s for s, _, _ in triples]
         print(
@@ -659,8 +703,31 @@ def parse_args():
     g.add_argument(
         "--threads",
         type=int,
-        default=os.cpu_count() or 1,
-        help="OMP_NUM_THREADS for all runs (default: nproc)",
+        default=min(16, os.cpu_count() or 16),
+        help="threads for all runs, passed to prisma_cpu_bench via --threads "
+        "and to TACO via OMP_NUM_THREADS (default: min(16, nproc) -- matches "
+        "SpMM/SpMV's safe-cap convention; this codebase's own measured "
+        "finding is that oversubscription past ~16 threads can be up to "
+        "~15x slower). Ignored if --threads-sweep is given.",
+    )
+    g.add_argument(
+        "--threads-sweep",
+        default=None,
+        dest="threads_sweep",
+        help="Sweep multiple thread counts instead of one fixed value. "
+        "Either a comma-separated list (e.g. '32,16,8,4,2,1') or a single "
+        "max value that gets auto-expanded by halving down to 1 (e.g. "
+        "'32' -> 32,16,8,4,2,1). The full matrix list is benchmarked once "
+        "per thread count, all appended to the same --out CSV, "
+        "distinguished by the 'threads' column.",
+    )
+    g.add_argument(
+        "--perf",
+        action="store_true",
+        help="Also collect hardware perf counters (cycles, instructions, "
+        "cache/branch/TLB misses) and peak RSS via `perf stat` + `time -v`, "
+        "one extra wrapped re-run per kernel call (needs perf_event_open "
+        "access; see perf_wrap.py). Roughly doubles wall time per call.",
     )
 
     g = p.add_argument_group("Paths")
@@ -813,6 +880,10 @@ def main() -> None:
     csv_path = Path(args.out)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
+    thread_values = (
+        _parse_thread_sweep(args.threads_sweep) if args.threads_sweep else [args.threads]
+    )
+
     print(f"TACO CPU bin   : {taco_bin or '(disabled)'}")
     print(f"TACO opt bin   : {taco_opt_bin or '(disabled)'}")
     print(f"Prisma bin     : {prisma_bin or '(disabled)'}")
@@ -820,56 +891,66 @@ def main() -> None:
     print(f"Output CSV     : {csv_path}")
     print(f"Matrices       : {len(matrices)}")
     print(f"Runs/matrix    : {args.runs}  (run_id 0 = warmup)")
-    print(f"Threads        : {args.threads}")
+    print(f"Threads        : {thread_values}")
     print(f"Timeout (s)    : {args.timeout}")
     print()
 
-    env = {**os.environ, "OMP_NUM_THREADS": str(args.threads)}
-
     write_header = _needs_header(csv_path)
     with open(csv_path, "a", newline="") as f_csv:
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        f_csv.write(
-            f"# {ts}  input={args.csv}  runs={args.runs}  threads={args.threads}\n"
-        )
         writer = csv.DictWriter(
             f_csv, fieldnames=_CSV_FIELDS, extrasaction="ignore", lineterminator="\n"
         )
         if write_header:
             writer.writeheader()
 
-        for i, row in enumerate(matrices, 1):
-            name = row["name"]
-            print(f"\n[{i}/{len(matrices)}] {name}")
+        # NOTE: prisma_top10's per-matrix specialized kernel is compiled
+        # inline inside benchmark_matrix (not cached upfront), so sweeping
+        # threads here recompiles it once per thread_values entry per
+        # matrix -- a real, known cost of this loop ordering, traded for
+        # not having to split benchmark_matrix into separate compile/run
+        # phases. Fine for a handful of sweep points; expensive for a long
+        # sweep across many matrices.
+        for threads in thread_values:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            f_csv.write(
+                f"# {ts}  input={args.csv}  runs={args.runs}  threads={threads}\n"
+            )
+            env = {**os.environ, "OMP_NUM_THREADS": str(threads)}
 
-            mtx = find_mtx(name, row.get("group", ""))
-            if mtx is None:
-                print(f"  MTX not found in {_DATA_ROOT} — skipping")
-                continue
-            print(f"  MTX → {mtx}")
+            for i, row in enumerate(matrices, 1):
+                name = row["name"]
+                print(f"\n[threads={threads}] [{i}/{len(matrices)}] {name}")
 
-            old_env = os.environ.copy()
-            os.environ.update(env)
-            try:
-                benchmark_matrix(
-                    row=row,
-                    mtx=mtx,
-                    taco_bin=taco_bin,
-                    taco_opt_bin=taco_opt_bin,
-                    prisma_bin=prisma_bin,
-                    runs=args.runs,
-                    timeout=args.timeout,
-                    writer=writer,
-                    f_csv=f_csv,
-                    run_generic=not args.no_generic and not args.no_prisma,
-                    run_top10=not args.no_top10 and not args.no_prisma,
-                    top_n=args.top_n,
-                    blas=args.blas,
-                    work_dir=work_dir,
-                )
-            finally:
-                os.environ.clear()
-                os.environ.update(old_env)
+                mtx = find_mtx(name, row.get("group", ""))
+                if mtx is None:
+                    print(f"  MTX not found in {_DATA_ROOT} — skipping")
+                    continue
+                print(f"  MTX → {mtx}")
+
+                old_env = os.environ.copy()
+                os.environ.update(env)
+                try:
+                    benchmark_matrix(
+                        row=row,
+                        mtx=mtx,
+                        taco_bin=taco_bin,
+                        taco_opt_bin=taco_opt_bin,
+                        prisma_bin=prisma_bin,
+                        runs=args.runs,
+                        timeout=args.timeout,
+                        writer=writer,
+                        f_csv=f_csv,
+                        run_generic=not args.no_generic and not args.no_prisma,
+                        run_top10=not args.no_top10 and not args.no_prisma,
+                        top_n=args.top_n,
+                        blas=args.blas,
+                        work_dir=work_dir,
+                        threads=threads,
+                        perf=args.perf,
+                    )
+                finally:
+                    os.environ.clear()
+                    os.environ.update(old_env)
 
     print(f"\nDone. Results appended to {csv_path}")
 

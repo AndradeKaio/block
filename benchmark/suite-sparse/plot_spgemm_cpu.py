@@ -27,9 +27,9 @@ from plotly.subplots import make_subplots
 # ---------------------------------------------------------------------------
 
 KERNEL_COLORS = {
-    # TACO variants → blues
-    "taco_cpu":      "#1f77b4",
-    "taco_cpu_opt":  "#08519c",
+    # TACO variants → reds
+    "taco_cpu":      "#d62728",
+    "taco_cpu_opt":  "#99000d",
     # Prisma variants → greens
     "prisma_generic": "#41ab5d",
     "prisma_top10":   "#006d2c",
@@ -38,7 +38,7 @@ KERNEL_COLORS = {
 KERNEL_DISPLAY = {
     "taco_cpu":       "TACO",
     "taco_cpu_opt":   "TACO (opt)",
-    "prisma_generic": "BLOCKS (generic)",
+    "prisma_generic": "BLOCKS",
     "prisma_top10":   "BLOCKS (specialized)",
 }
 
