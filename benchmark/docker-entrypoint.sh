@@ -38,7 +38,7 @@ mkdir -p "$DATA_ROOT" "$RESULTS_DIR" "$WORK_DIR"
 cp "$MATRICES_CSV" "$WORK_DIR/matrices.csv"
 
 echo "== Mining matrices (workers=$WORKERS) =="
-python mining/mine_matrices.py \
+python /app/mining/mine_matrices.py \
   --matrices-csv "$WORK_DIR/matrices.csv" \
   --output-dir "$DATA_ROOT" \
   --workers "$WORKERS"
